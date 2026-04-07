@@ -1,0 +1,9 @@
+{
+  "name": "sgocr",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "review": "bun run src/review_app/server.ts",
+    "test:review": "bun test test/review_app"
+  }
+}
