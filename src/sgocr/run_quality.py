@@ -174,6 +174,20 @@ def compute_run_quality(summary: dict[str, Any], rows: list[dict[str, Any]]) -> 
         num_types_with_coverage=num_types_with_coverage,
     )
 
+    inline_scored_rows = [row for row in rows if row.get("inline_frontier_correct") is not None]
+    inline_frontier_mean = (
+        sum(1.0 for row in inline_scored_rows if bool(row.get("inline_frontier_correct"))) / len(inline_scored_rows)
+        if inline_scored_rows
+        else float((summary.get("inline_frontier") or {}).get("mean_inline_frontier_correct") or 0.0)
+    )
+    inline_frontier_scored = (
+        len(inline_scored_rows)
+        if inline_scored_rows
+        else int((summary.get("inline_frontier") or {}).get("scored_rows") or 0)
+    )
+    precision_first_score = round(inline_frontier_mean * math.sqrt(max(inline_frontier_scored, 0)), 4)
+    sweep_score = precision_first_score if inline_frontier_scored > 0 else q3
+
     return {
         "accepted_qas": accepted_qas,
         "generated_qas": generated_qas,
@@ -194,6 +208,10 @@ def compute_run_quality(summary: dict[str, Any], rows: list[dict[str, Any]]) -> 
         "validation_failed": validation_failed,
         "quality_score": quality,
         "q3_score": q3,
+        "inline_frontier_mean": round(inline_frontier_mean, 4),
+        "inline_frontier_scored": inline_frontier_scored,
+        "precision_first_score": precision_first_score,
+        "sweep_score": sweep_score,
         "type_diversity": type_diversity,
         "num_types_with_coverage": num_types_with_coverage,
         "summary": summary,

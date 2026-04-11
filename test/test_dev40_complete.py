@@ -4,7 +4,10 @@ import unittest
 
 from sgocr.bootstrap_kd import bootstrap_anchor_boxes, compute_resolvability
 from sgocr.dev40_complete import (
+    _unique_anchor_can_skip_global_location,
     build_question_candidates,
+    build_inline_frontier_prompt,
+    inline_frontier_response_schema,
     build_sign_tuples,
     build_tags,
     location_ambiguity_score,
@@ -384,6 +387,87 @@ class TestDev40Complete(unittest.TestCase):
         self.assertFalse(validation["accepted"])
         self.assertEqual(failure, "direct_read_specific_location_missing")
 
+    def test_unique_direct_read_skips_global_location_requirement(self) -> None:
+        tuple_row = {
+            "tuple_id": "img-1::word::a",
+            "image_id": "img-1",
+            "image_path": "data/fake.jpg",
+            "image_width": 224,
+            "image_height": 224,
+            "ann_id": "a",
+            "answer": "HELLO",
+            "answer_normalized": "hello",
+            "text_polygon": [10, 10, 80, 10, 80, 30, 10, 30],
+            "text_bbox": [10, 10, 70, 20],
+            "text_node_ids": ["a"],
+            "child_words": ["HELLO"],
+            "anchor_label": "red can",
+            "anchor_synonyms": ["red can", "can"],
+            "location_phrase": "center-left area of the image",
+            "location_synonyms": ["center-left area of the image"],
+            "specific_location_phrase": "upper text in the center-left area of the image",
+            "specific_location_synonyms": ["upper text in the center-left area of the image"],
+            "anchor_local_phrase": "on the red can",
+            "anchor_local_synonyms": ["on the red can"],
+            "anchor_box": [0, 0, 160, 120],
+            "anchor_score": 1.0,
+            "anchor_category": "container",
+            "relation": "on",
+            "ref_label": None,
+            "ref_box": None,
+            "unique": True,
+            "answer_level": "word",
+            "ocr_confidence": 1.0,
+            "consensus_tier": "bootstrap_gt",
+            "dataset_source": "textocr_bootstrap",
+            "region_key": "cc",
+            "resolvable": True,
+            "resolvability": {"text_px_w": 70.0, "text_px_h": 20.0},
+            "kd_metadata": {
+                "text_density": 2,
+                "competing_tuples": 0,
+                "coarse_region_competitors": 0,
+                "bucket_competitors": 0,
+                "anchor_overlap_competitors": 0,
+                "anchor_conflict_count": 0,
+                "local_text_cluster_shape": "line",
+                "local_text_bucket_occupancy": 1,
+                "neighboring_text": [],
+                "nearby_anchors": [],
+            },
+            "valid_text_count": 2,
+            "area_fraction": 0.03,
+            "text_length": 5,
+            "density_bucket": "low",
+            "area_bucket": "medium",
+            "group_kind": "word",
+        }
+        candidate = {
+            "candidate_id": "img-1::word::a::DIRECT_READ",
+            "candidate_index": 1,
+            "tuple": tuple_row,
+            "question_type": "DIRECT_READ",
+            "quality": 1.0,
+            "answer_source": "mechanical",
+            "answer_type": "text_string",
+            "expected_answer": "HELLO",
+            "yesno_polarity": None,
+            "yesno_distractor_source": None,
+            "text_property_type": None,
+            "anchor_property_type": None,
+            "query_location_required": True,
+        }
+        self.assertTrue(_unique_anchor_can_skip_global_location(candidate))
+        item = {
+            "candidate_index": 1,
+            "question_type": "DIRECT_READ",
+            "question": "What does the text on the red can say?",
+            "answer": "HELLO",
+        }
+        validation, _summary, failure = validate_candidate_output(candidate, item)
+        self.assertTrue(validation["accepted"])
+        self.assertIsNone(failure)
+
     def test_text_property_visual_candidate_validation(self) -> None:
         tuple_row = {
             "tuple_id": "img-1::word::a",
@@ -578,6 +662,21 @@ class TestDev40Complete(unittest.TestCase):
         self.assertTrue(validation["accepted"])
         self.assertEqual(summary["accepted_count"], 1)
         self.assertIsNone(failure)
+
+    def test_inline_frontier_prompt_and_schema(self) -> None:
+        row = {
+            "sample_id": "sample-1",
+            "image_id": "img-1",
+            "image_path": "data/fake.jpg",
+            "question": "What does the text on the red can say?",
+            "answer": "HELLO",
+            "tags": {"question_type": "DIRECT_READ", "answer_type": "text_string"},
+        }
+        prompt = build_inline_frontier_prompt([row])
+        self.assertIn("Candidate 1", prompt)
+        self.assertIn("What does the text on the red can say?", prompt)
+        schema = inline_frontier_response_schema(2)
+        self.assertEqual(schema["properties"]["items"]["minItems"], 2)
 
     def test_direct_read_requires_coarse_location_when_competing(self) -> None:
         tuple_row = {

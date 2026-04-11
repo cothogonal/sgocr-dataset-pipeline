@@ -7,11 +7,13 @@ import io
 import json
 import os
 import statistics
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
 import requests
+from collections import Counter
 from PIL import Image
 
 from .bootstrap import write_json, write_jsonl
@@ -111,6 +113,8 @@ def _build_pointing_row(row: dict[str, Any]) -> dict[str, Any]:
     grounding = dict(row.get("grounding") or {})
     image_id = str(row.get("image_id") or "")
     question_id = str(row.get("sample_id") or row.get("ann_id") or image_id)
+    image_path_value = str(row.get("image_path") or "")
+    image_path = str((REPO_ROOT / image_path_value).resolve()) if image_path_value and not os.path.isabs(image_path_value) else image_path_value
     bbox_xyxy = grounding.get("text_bbox_xyxy")
     if not isinstance(bbox_xyxy, list) or len(bbox_xyxy) != 4:
         text_bbox = grounding.get("text_bbox") or row.get("text_bbox")
@@ -123,7 +127,7 @@ def _build_pointing_row(row: dict[str, Any]) -> dict[str, Any]:
         "id": question_id,
         "question_id": question_id,
         "image_id": image_id,
-        "image_path": row.get("image_path"),
+        "image_path": image_path,
         "question": row.get("question", ""),
         "answer": row.get("answer", ""),
         "answers": [row.get("answer", "")],
@@ -148,7 +152,7 @@ def _build_pointing_row(row: dict[str, Any]) -> dict[str, Any]:
         },
         "image": {
             "id": image_id,
-            "path": row.get("image_path"),
+            "path": image_path,
             "width": row.get("image_width"),
             "height": row.get("image_height"),
         },
@@ -271,6 +275,21 @@ def _encode_image(path: Path, *, max_side: int = 1024, quality: int = 90) -> tup
 def _benchmark_prompt(row: dict[str, Any]) -> str:
     tags = dict(row.get("tags") or {})
     question_type = str(tags.get("question_type") or row.get("question_type") or "").strip()
+
+    if question_type == "REVERSE_GROUND":
+        anchor_label = str(tags.get("anchor_label") or "")
+        anchor_hint = f" (anchor object: {anchor_label})" if anchor_label else ""
+        return (
+            "Answer the visual question using the image.\n"
+            "This is a location question — answer with a SHORT plain-text location phrase only.\n"
+            "Do NOT return coordinates, JSON, point data, arrays, or any structured format.\n"
+            "Do NOT say 'I cannot determine' or refuse — give the most visually plausible answer.\n"
+            "Answer length: 1 to 6 words. No explanation.\n"
+            f"Example: Q: 'Where is the text \"EXIT\"?' → A: 'on the green sign'\n"
+            f"Question type: REVERSE_GROUND{anchor_hint}\n"
+            f"Question: {row.get('question', '')}"
+        )
+
     return (
         "Answer the visual question using the image.\n"
         "Give only the shortest literal answer.\n"
@@ -416,17 +435,152 @@ def _call_model(spec: BenchmarkModelSpec, row: dict[str, Any]) -> dict[str, Any]
     raise ValueError(f"Unsupported provider: {spec.provider}")
 
 
+def _strip_accents(s: str) -> str:
+    """Normalize to NFKC (fullwidth/ligature decomposition) then NFD and remove combining accent marks."""
+    s = unicodedata.normalize("NFKC", s)
+    return "".join(c for c in unicodedata.normalize("NFD", s) if unicodedata.category(c) != "Mn")
+
+
+_RG_STOPWORDS: frozenset[str] = frozenset({
+    # English function words
+    "a", "an", "the", "in", "on", "at", "of", "to", "is", "it", "be", "as",
+    "and", "or", "for", "with", "by", "from", "this", "that", "are", "was",
+    "not", "but", "if", "its", "into", "do", "so",
+    # SGOCR gold-template words (appear in nearly every gold answer, so useless as discriminators)
+    "area", "image", "text",
+    # Common spatial connectors that appear in any location description
+    "near", "around",
+})
+
+
+def _word_f1(gold_norm: str, pred_norm: str) -> float:
+    """Raw unigram word-level F1, accent-insensitive."""
+    g = _strip_accents(gold_norm).split()
+    p = _strip_accents(pred_norm).split()
+    if not g or not p:
+        return 0.0
+    common = sum((Counter(g) & Counter(p)).values())
+    precision = common / len(p)
+    recall = common / len(g)
+    if precision + recall == 0.0:
+        return 0.0
+    return 2.0 * precision * recall / (precision + recall)
+
+
+def _content_word_f1(gold_norm: str, pred_norm: str) -> float:
+    """Content-word F1 for REVERSE_GROUND: strips stopwords and template words before scoring.
+
+    Raw word-F1 has false positives because spatial descriptions share many function words
+    ("on", "the", "in", "of", "area", "image"). This version measures overlap on semantically
+    meaningful words (object labels, directional terms: 'upper', 'lower', 'left', 'right',
+    'center', 'top', 'bottom', anchor nouns, etc.).
+    """
+    def content_words(s: str) -> list[str]:
+        return [w for w in s.split() if w not in _RG_STOPWORDS and len(w) > 1]
+
+    g = content_words(gold_norm)
+    p = content_words(pred_norm)
+    if not g or not p:
+        return 0.0
+    common = sum((Counter(g) & Counter(p)).values())
+    precision = common / len(p)
+    recall = common / len(g)
+    if precision + recall == 0.0:
+        return 0.0
+    return 2.0 * precision * recall / (precision + recall)
+
+
+def _partial_correct_direct_read(gold_norm: str, pred_norm: str) -> bool:
+    """Partial credit for DIRECT_READ: the model read correct text but in more or less context.
+
+    Accepts when:
+    - Gold word-set ⊆ pred word-set (model read a superset — full caption vs. fragment).
+    - Pred word-set ⊆ gold word-set AND pred is short ≤ 3 words (partial read).
+    - Plural tolerance: trailing-s stems are compared (RAILHAWK ≈ RAILHAWKS).
+    - Word-join tolerance: concatenated pred tokens match a single gold token, or vice versa
+      (handles OCR merge artifacts: "EXTRALITE" ≈ "EXTRA LITE", "INGOD" ≈ "IN GOD").
+    - Substring matching for short gold fragments (<3 chars after stripping).
+    - Trailing OCR punctuation artifacts stripped from gold before comparison.
+    """
+    # Strip trailing OCR artifacts (e.g. "REFRIGERATORS]" → "REFRIGERATORS", "en," → "en")
+    gold_clean = gold_norm.rstrip("][(.,;:!?)'\"").strip()
+    if not gold_clean:
+        return False
+    # Accent-insensitive comparison throughout
+    g = _strip_accents(gold_clean)
+    p = _strip_accents(pred_norm)
+    # Short gold fragments: substring containment instead of hard False
+    # e.g. gold="en", pred="en cada" → True
+    if len(gold_clean) < 3:
+        return bool(g) and g in p
+    g_words = g.split()
+    p_words = p.split()
+    if not g_words or not p_words:
+        return False
+
+    def _stem(w: str) -> str:
+        return w[:-1] if len(w) > 3 and w.endswith("s") else w
+
+    g_set = {_stem(w) for w in g_words}
+    p_set = {_stem(w) for w in p_words}
+
+    # Model read a superset of what was expected.
+    if g_set.issubset(p_set):
+        return True
+    # Model gave a short sub-fragment of the gold (partial read).
+    if len(p_words) <= 3 and p_set.issubset(g_set):
+        return True
+    # Word-join: OCR merged multi-word text into one token, or model split a merged token.
+    # Only apply when the discrepancy is a single concatenated token vs. 2+ tokens.
+    if len(g_words) == 1 and len(g) >= 4 and len(p_words) >= 2:
+        if g == "".join(p_words):
+            return True
+    if len(p_words) == 1 and len(p) >= 4 and len(g_words) >= 2:
+        if p == "".join(g_words):
+            return True
+    return False
+
+
 def _score_prediction(row: dict[str, Any], prediction: str) -> dict[str, Any]:
     tags = dict(row.get("tags") or {})
+    question_type = str(tags.get("question_type") or row.get("question_type") or "").strip().upper()
     gold = str(row.get("answer") or "")
     answer_type = str(tags.get("answer_type") or "")
     pred_norm = _normalize_answer_by_type(prediction, answer_type)
     gold_norm = _normalize_answer_by_type(gold, answer_type)
+    exact = bool(pred_norm == gold_norm)
+    # Also accept accent-equivalent exact matches (e.g. "CORAZON" == "CORAZÓN" after stripping)
+    if not exact:
+        exact = bool(_strip_accents(pred_norm) == _strip_accents(gold_norm))
+
+    # DIRECT_READ: partial credit when the model reads more/less context around the target text.
+    partial = False
+    if question_type == "DIRECT_READ" and not exact:
+        partial = _partial_correct_direct_read(gold_norm, pred_norm)
+
+    # REVERSE_GROUND: word-level F1 ≥ 0.5 counts as semantically correct.
+    # Exact match is useless here — gold encodes our template format, frontier models use natural
+    # language to describe the same location.
+    word_f1_val = 0.0
+    semantic = False
+    if question_type == "REVERSE_GROUND":
+        # Use content-word F1 (strips stopwords + template words) to avoid false positives
+        # from shared function words like "on", "the", "in", "of", "area", "image".
+        word_f1_val = _content_word_f1(gold_norm, pred_norm)
+        semantic = word_f1_val >= 0.5
+
+    # soft_correct: the most lenient correct signal per question type.
+    soft = exact or partial or semantic
+
     return {
         "prediction_raw": prediction,
         "prediction_norm": pred_norm,
         "gold_norm": gold_norm,
-        "exact_correct": bool(pred_norm == gold_norm),
+        "exact_correct": exact,
+        "partial_correct": partial,
+        "semantic_correct": semantic,
+        "word_f1": round(word_f1_val, 4),
+        "soft_correct": soft,
     }
 
 
@@ -504,11 +658,24 @@ def run_frontier_benchmark(
         errors = sum(1 for row in per_model if row.get("error_type"))
         prediction_rows.extend(per_model)
         valid = [row for row in per_model if not row.get("error_type")]
-        accuracy = (
-            sum(1 for row in valid if bool(row.get("exact_correct"))) / len(valid)
-            if valid
-            else 0.0
-        )
+        n = len(valid) or 1
+        exact_acc = sum(1 for r in valid if r.get("exact_correct")) / n
+        # partial_correct: DIRECT_READ superset/subset credit (valid for all types, 0 outside DR)
+        partial_acc = sum(1 for r in valid if r.get("exact_correct") or r.get("partial_correct")) / n
+        # semantic_correct: REVERSE_GROUND word-F1 ≥ 0.5 credit
+        semantic_acc = sum(1 for r in valid if r.get("exact_correct") or r.get("semantic_correct")) / n
+        # soft_correct: best per-type signal combined
+        soft_acc = sum(1 for r in valid if r.get("soft_correct")) / n
+
+        def _acc_by_type(qtype: str) -> dict[str, float]:
+            subset = [r for r in valid if str(r.get("question_type") or "").upper() == qtype]
+            nn = len(subset) or 1
+            return {
+                "n": len(subset),
+                "exact": round(sum(1 for r in subset if r.get("exact_correct")) / nn, 4),
+                "soft": round(sum(1 for r in subset if r.get("soft_correct")) / nn, 4),
+            }
+
         summaries.append(
             {
                 "provider": spec.provider,
@@ -517,7 +684,17 @@ def run_frontier_benchmark(
                 "rows": len(per_model),
                 "valid_rows": len(valid),
                 "errors": errors,
-                "exact_accuracy": accuracy,
+                "exact_accuracy": round(exact_acc, 4),
+                "partial_accuracy": round(partial_acc, 4),
+                "semantic_accuracy": round(semantic_acc, 4),
+                "soft_accuracy": round(soft_acc, 4),
+                "by_type": {
+                    "DIRECT_READ": _acc_by_type("DIRECT_READ"),
+                    "REVERSE_GROUND": _acc_by_type("REVERSE_GROUND"),
+                    "YES_NO": _acc_by_type("YES_NO"),
+                    "TEXT_PROPERTY": _acc_by_type("TEXT_PROPERTY"),
+                    "ANCHOR_PROPERTY": _acc_by_type("ANCHOR_PROPERTY"),
+                },
             }
         )
         write_jsonl(out_dir / "predictions.jsonl", prediction_rows)
@@ -536,7 +713,52 @@ def run_frontier_benchmark(
         "models": summaries,
     }
     write_json(out_dir / "summary.json", summary)
+    # Write a per-sample eval index back to the experiment dir so the review app can display
+    # frontier model predictions alongside each QA pair without re-joining at load time.
+    _write_frontier_eval_index(experiment_dir, prediction_rows)
     return summary
+
+
+def _write_frontier_eval_index(experiment_dir: Path, prediction_rows: list[dict[str, Any]]) -> None:
+    """Merge all frontier predictions into experiment_dir/frontier_evals_index.jsonl.
+
+    Each row in the output file has the format:
+      {"sample_id": "...", "evals": [{"model": "...", "prediction": "...", ...}, ...]}
+
+    Existing entries for different models are preserved so that running multiple eval
+    passes accumulates results rather than overwriting them.
+    """
+    index_path = experiment_dir / "frontier_evals_index.jsonl"
+    # Load existing index
+    by_sample: dict[str, dict[str, Any]] = {}
+    if index_path.exists():
+        for row in _iter_jsonl(index_path):
+            sid = str(row.get("sample_id") or "")
+            if sid:
+                by_sample[sid] = row
+    # Merge new predictions
+    for row in prediction_rows:
+        sid = str(row.get("sample_id") or "")
+        if not sid or row.get("error_type"):
+            continue
+        entry = by_sample.setdefault(sid, {"sample_id": sid, "evals": []})
+        existing_evals: list[dict[str, Any]] = entry.get("evals") or []  # type: ignore[assignment]
+        model_key = str(row.get("requested_model") or row.get("model") or "")
+        # Replace entry for same model, append for new models
+        existing_evals = [e for e in existing_evals if str(e.get("model") or "") != model_key]
+        existing_evals.append({
+            "model": model_key,
+            "provider": row.get("provider"),
+            "prediction": row.get("prediction_raw") or "",
+            "prediction_norm": row.get("prediction_norm") or "",
+            "exact_correct": bool(row.get("exact_correct")),
+            "partial_correct": bool(row.get("partial_correct")),
+            "semantic_correct": bool(row.get("semantic_correct")),
+            "soft_correct": bool(row.get("soft_correct")),
+            "word_f1": row.get("word_f1"),
+        })
+        entry["evals"] = existing_evals
+    write_jsonl(index_path, list(by_sample.values()))
 
 
 def compute_frontier_agreement(*, benchmark_dir: Path) -> dict[str, Any]:

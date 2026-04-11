@@ -5,7 +5,15 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from sgocr.dev200_eval import SweepRun, _build_pointing_row, compute_frontier_agreement, prepare_bridge_ft_eval
+from sgocr.dev200_eval import (
+    SweepRun,
+    _build_pointing_row,
+    _content_word_f1,
+    _partial_correct_direct_read,
+    _score_prediction,
+    compute_frontier_agreement,
+    prepare_bridge_ft_eval,
+)
 
 
 def _sample_row() -> dict:
@@ -116,6 +124,100 @@ class TestDev200Eval(unittest.TestCase):
             self.assertAlmostEqual(summary["overall_unanimous_rate"], 0.5)
             self.assertEqual(len(summary["pairwise"]), 1)
             self.assertAlmostEqual(summary["pairwise"][0]["agreement_rate"], 0.5)
+
+
+class TestScoringFunctions(unittest.TestCase):
+    # -----------------------------------------------------------------
+    # _partial_correct_direct_read
+    # -----------------------------------------------------------------
+    def test_partial_superset_match(self) -> None:
+        # Model reads full caption; gold is a fragment within it.
+        self.assertTrue(_partial_correct_direct_read("ge,pepco&", "ge,pepco& other corporations yes"))
+
+    def test_partial_short_subset_match(self) -> None:
+        # Model gives a short sub-fragment of gold (≤3 words).
+        self.assertTrue(_partial_correct_direct_read("valley troublesome rd", "troublesome rd"))
+
+    def test_partial_noise_guard_short_gold(self) -> None:
+        # Gold is too short (< 3 chars) — should not count as partial.
+        self.assertFalse(_partial_correct_direct_read("en", "en cada"))
+
+    def test_partial_no_match(self) -> None:
+        # Completely unrelated prediction.
+        self.assertFalse(_partial_correct_direct_read("highland", "glenfarclas"))
+
+    # -----------------------------------------------------------------
+    # _content_word_f1
+    # -----------------------------------------------------------------
+    def test_content_word_f1_anchor_match(self) -> None:
+        # Both mention "box" and "top"; function words stripped.
+        score = _content_word_f1(
+            "on the box near the top of the image",
+            "on the box",
+        )
+        self.assertGreaterEqual(score, 0.5)
+
+    def test_content_word_f1_no_false_positive(self) -> None:
+        # "top" shared but anchor objects are completely different — should score low.
+        score = _content_word_f1(
+            "on the sign wall near the top of the image",
+            "on the top tube of the bicycle frame",
+        )
+        self.assertLess(score, 0.5)
+
+    def test_content_word_f1_zero_on_empty(self) -> None:
+        self.assertEqual(_content_word_f1("", "something"), 0.0)
+        self.assertEqual(_content_word_f1("something", ""), 0.0)
+
+    # -----------------------------------------------------------------
+    # _score_prediction: full pipeline
+    # -----------------------------------------------------------------
+    def _make_row(self, question_type: str, answer: str) -> dict:
+        return {
+            "answer": answer,
+            "tags": {"question_type": question_type, "answer_type": "text_string"},
+        }
+
+    def test_score_exact_correct(self) -> None:
+        row = self._make_row("DIRECT_READ", "OPEN")
+        result = _score_prediction(row, "open")
+        self.assertTrue(result["exact_correct"])
+        self.assertTrue(result["soft_correct"])
+        self.assertFalse(result["partial_correct"])
+        self.assertFalse(result["semantic_correct"])
+
+    def test_score_direct_read_partial(self) -> None:
+        row = self._make_row("DIRECT_READ", "valley troublesome rd")
+        result = _score_prediction(row, "valley troublesome rd going north")
+        self.assertFalse(result["exact_correct"])
+        self.assertTrue(result["partial_correct"])
+        self.assertTrue(result["soft_correct"])
+
+    def test_score_reverse_ground_semantic(self) -> None:
+        # GPT-style terse anchor answer matches our template via content-word F1.
+        row = self._make_row("REVERSE_GROUND", "on the sign in the upper-left area of the image")
+        result = _score_prediction(row, "stop sign")
+        self.assertFalse(result["exact_correct"])
+        # "sign" overlaps with "sign" in gold — content-word F1 should be ≥ 0.5
+        self.assertGreaterEqual(result["word_f1"], 0.5)
+        self.assertTrue(result["semantic_correct"])
+        self.assertTrue(result["soft_correct"])
+
+    def test_score_reverse_ground_no_semantic(self) -> None:
+        # Gold mentions sign; pred says bicycle — should not be semantic_correct.
+        row = self._make_row("REVERSE_GROUND", "on the sign wall near the top of the image")
+        result = _score_prediction(row, "on the top tube of the bicycle frame")
+        self.assertFalse(result["exact_correct"])
+        self.assertFalse(result["semantic_correct"])
+        self.assertFalse(result["soft_correct"])
+
+    def test_score_yes_no_exact(self) -> None:
+        row = self._make_row("YES_NO", "Yes")
+        result = _score_prediction(row, "yes")
+        self.assertTrue(result["exact_correct"])
+        self.assertTrue(result["soft_correct"])
+        self.assertFalse(result["semantic_correct"])
+        self.assertFalse(result["partial_correct"])
 
 
 if __name__ == "__main__":

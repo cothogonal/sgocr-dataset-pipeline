@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import os
+import tempfile
 import unittest
 from unittest.mock import patch
 
+from PIL import Image
+
 from sgocr.bootstrap_kd import compute_resolvability
-from sgocr.full_pipeline_dev40 import _filter_subsumed_rows, build_merged_sign_tuples_for_image
+from sgocr.full_pipeline_dev40 import _filter_subsumed_rows, _order_component_nodes, build_merged_sign_tuples_for_image, run_anchor_stage
 
 
 def make_text_node(
@@ -128,6 +131,104 @@ class TestFullPipelineDev40(unittest.TestCase):
         self.assertEqual(removed, 2)
         kept_ids = {row["tuple_id"] for row in kept}
         self.assertEqual(kept_ids, {"img-merge::merge::1", "img-merge::word::z"})
+
+    def test_order_component_nodes_keeps_left_to_right_priority(self) -> None:
+        nodes = [
+            make_text_node("a", "LEFT", 20, 40, 60, 60),
+            make_text_node("b", "RIGHT", 90, 34, 140, 54),
+            make_text_node("c", "FAR", 160, 20, 210, 40),
+        ]
+        ordered = _order_component_nodes(nodes)
+        self.assertEqual([node["node_id"] for node in ordered], ["a", "b", "c"])
+
+    def test_run_anchor_stage_can_use_qwen_for_local_tag_discovery(self) -> None:
+        class FakeQwenGrounder:
+            def __init__(self, **_: object) -> None:
+                pass
+
+            def detect_many(self, requests):
+                out = {}
+                for req in requests:
+                    if req.image_obj is not None:
+                        if str(req.image_id).endswith("::n1"):
+                            out[req.image_id] = [
+                                {
+                                    "label": "bottle",
+                                    "raw_label": "brown bottle",
+                                    "box": [5.0, 5.0, 55.0, 95.0],
+                                    "score": 0.62,
+                                    "source": "qwen3_vl_vllm",
+                                    "raw_text": '[{"bbox_2d":[1,2,3,4],"label":"bottle"}]',
+                                }
+                            ]
+                        else:
+                            out[req.image_id] = [
+                                {
+                                    "label": "screen",
+                                    "raw_label": "screen",
+                                    "box": [0.0, 0.0, 70.0, 50.0],
+                                    "score": 0.62,
+                                    "source": "qwen3_vl_vllm",
+                                    "raw_text": '[{"bbox_2d":[1,2,3,4],"label":"screen"}]',
+                                }
+                            ]
+                    else:
+                        out[req.image_id] = [
+                            {
+                                "label": "bottle",
+                                "raw_label": "bottle",
+                                "box": [8.0, 8.0, 84.0, 128.0],
+                                "score": 0.62,
+                                "source": "qwen3_vl_vllm",
+                                "raw_text": '[{"bbox_2d":[1,2,3,4],"label":"bottle"}]',
+                            },
+                            {
+                                "label": "screen",
+                                "raw_label": "screen",
+                                "box": [96.0, 16.0, 214.0, 92.0],
+                                "score": 0.62,
+                                "source": "qwen3_vl_vllm",
+                                "raw_text": '[{"bbox_2d":[1,2,3,4],"label":"screen"}]',
+                            },
+                        ]
+                return out
+
+            def close(self) -> None:
+                return None
+
+        nodes = [
+            make_text_node("n1", "BROWN", 20, 30, 50, 52, image_id="img-qwen"),
+            make_text_node("n2", "LCD", 130, 32, 168, 54, image_id="img-qwen"),
+        ]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            image_path = os.path.join(tmpdir, "img.jpg")
+            Image.new("RGB", (256, 256), color="white").save(image_path)
+            with patch.dict(
+                os.environ,
+                {
+                    "SGOCR_ANCHOR_TAG_DISCOVERY_BACKEND": "qwen3_vl_vllm",
+                    "SGOCR_ANCHOR_CANDIDATE_BACKEND": "qwen3_vl_vllm",
+                    "SGOCR_QWEN_ANCHOR_BATCH_SIZE": "1",
+                },
+                clear=True,
+            ):
+                with patch("sgocr.full_pipeline_dev40.QwenAnchorGrounderVLLM", FakeQwenGrounder):
+                    anchor_tag_rows, grounded_anchor_rows, best_anchor_by_node = run_anchor_stage(
+                        image_specs=[{"image_id": "img-qwen", "image_path": image_path}],
+                        resolvable_nodes=nodes,
+                        device="cpu",
+                        max_tags_per_image=8,
+                        grounding_threshold=0.28,
+                    )
+        self.assertEqual(len(anchor_tag_rows), 2)
+        self.assertEqual(anchor_tag_rows[0]["discovered_tags"][0], "brown bottle")
+        self.assertEqual(anchor_tag_rows[1]["discovered_tags"][0], "screen")
+        self.assertIn("brown bottle", anchor_tag_rows[0]["final_prompt_tags"])
+        self.assertIn("screen", anchor_tag_rows[1]["final_prompt_tags"])
+        self.assertEqual(best_anchor_by_node[("img-qwen", "n1")]["label"], "brown bottle")
+        self.assertEqual(best_anchor_by_node[("img-qwen", "n2")]["label"], "screen")
+        nonempty = [row for row in grounded_anchor_rows if row["top_candidates"]]
+        self.assertEqual(len(nonempty), 2)
 
 
 if __name__ == "__main__":

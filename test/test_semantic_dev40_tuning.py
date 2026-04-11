@@ -12,23 +12,34 @@ class TestSemanticDev40Tuning(unittest.TestCase):
         with patch.dict(os.environ, {}, clear=True):
             tuning = load_semantic_dev40_tuning()
         self.assertEqual(tuning.location_wording_mode, "balanced")
+        self.assertEqual(tuning.ocr_frontend, "classic")
+        self.assertEqual(tuning.anchor_tag_discovery_backend, "florence")
+        self.assertEqual(tuning.qwen_anchor_tag_discovery_vocab_mode, "constrained")
+        self.assertEqual(tuning.anchor_candidate_backend, "florence_dino")
         self.assertEqual(tuning.teacher_strictness, "strict")
         self.assertEqual(tuning.max_negative_yesno_per_image, 1)
         self.assertEqual(tuning.anchor_prompt_expansion_mode, "none")
         self.assertEqual(tuning.anchor_relabel_mode, "none")
+        self.assertEqual(tuning.anchor_relabel_generic_mode, "standard")
         self.assertEqual(tuning.sam3_apply_mode, "all")
+        self.assertEqual(tuning.gemini_api_mode, "sync")
+        self.assertEqual(tuning.gemini_batch_chunk_size, 48)
 
     def test_env_overrides_are_applied(self) -> None:
         with patch.dict(
             os.environ,
             {
                 "SGOCR_GROUNDED_EXCLUSION_MIN_STRENGTH": "2.5",
-                "SGOCR_LOCATION_WORDING_MODE": "lite",
+                "SGOCR_OCR_FRONTEND": "nemotron_v2",
+                "SGOCR_ANCHOR_TAG_DISCOVERY_BACKEND": "qwen3_vl_vllm",
+                "SGOCR_QWEN_ANCHOR_TAG_DISCOVERY_VOCAB_MODE": "open",
+                "SGOCR_ANCHOR_CANDIDATE_BACKEND": "qwen3_vl_vllm",
                 "SGOCR_REVERSE_GROUND_DIRECTIONAL_LOCAL_BIAS": "0.35",
                 "SGOCR_REVERSE_GROUND_DIRECTIONAL_MIXED_BIAS": "0.15",
                 "SGOCR_MAX_NEGATIVE_YESNO_PER_IMAGE": "0",
                 "SGOCR_ANCHOR_PROMPT_EXPANSION_MODE": "supportive",
                 "SGOCR_ANCHOR_RELABEL_MODE": "flash",
+                "SGOCR_ANCHOR_RELABEL_GENERIC_MODE": "anti_generic",
                 "SGOCR_DETECTOR_MODE": "ppocr_craft_ensemble",
                 "SGOCR_AMBIGUITY_HARD_REJECT_SCORE": "6",
                 "SGOCR_SAM3_REFINE_MODE": "top2",
@@ -36,17 +47,29 @@ class TestSemanticDev40Tuning(unittest.TestCase):
                 "SGOCR_SAM3_APPLY_MODE": "targeted",
                 "SGOCR_TEXT_MERGE_ENABLED": "1",
                 "SGOCR_TEXT_MERGE_GAP_RATIO_MAX": "2.1",
+                "SGOCR_REVERSE_GROUND_ANSWER_STYLE": "frontier_rich",
+                "SGOCR_LOCATION_WORDING_MODE": "rich_local",
+                "SGOCR_QWEN_ANCHOR_MODEL": "Qwen/Qwen3-VL-8B-Instruct-FP8",
+                "SGOCR_QWEN_ANCHOR_GPU_MEMORY_UTILIZATION": "0.66",
+                "SGOCR_QWEN_ANCHOR_BATCH_SIZE": "3",
+                "SGOCR_GEMINI_API_MODE": "batch",
+                "SGOCR_GEMINI_BATCH_CHUNK_SIZE": "16",
             },
             clear=True,
         ):
             tuning = load_semantic_dev40_tuning()
         self.assertEqual(tuning.grounded_exclusion_min_strength, 2.5)
-        self.assertEqual(tuning.location_wording_mode, "lite")
+        self.assertEqual(tuning.ocr_frontend, "nemotron_v2")
+        self.assertEqual(tuning.anchor_tag_discovery_backend, "qwen3_vl_vllm")
+        self.assertEqual(tuning.qwen_anchor_tag_discovery_vocab_mode, "open")
+        self.assertEqual(tuning.anchor_candidate_backend, "qwen3_vl_vllm")
+        self.assertEqual(tuning.location_wording_mode, "rich_local")
         self.assertEqual(tuning.reverse_ground_directional_local_bias, 0.35)
         self.assertEqual(tuning.reverse_ground_directional_mixed_bias, 0.15)
         self.assertEqual(tuning.max_negative_yesno_per_image, 0)
         self.assertEqual(tuning.anchor_prompt_expansion_mode, "supportive")
         self.assertEqual(tuning.anchor_relabel_mode, "flash")
+        self.assertEqual(tuning.anchor_relabel_generic_mode, "anti_generic")
         self.assertEqual(tuning.detector_mode, "ppocr_craft_ensemble")
         self.assertEqual(tuning.ambiguity_hard_reject_score, 6)
         self.assertEqual(tuning.sam3_refine_mode, "top2")
@@ -54,14 +77,45 @@ class TestSemanticDev40Tuning(unittest.TestCase):
         self.assertEqual(tuning.sam3_apply_mode, "targeted")
         self.assertTrue(tuning.text_merge_enabled)
         self.assertEqual(tuning.text_merge_gap_ratio_max, 2.1)
+        self.assertEqual(tuning.reverse_ground_answer_style, "frontier_rich")
+        self.assertEqual(tuning.qwen_anchor_model, "Qwen/Qwen3-VL-8B-Instruct-FP8")
+        self.assertEqual(tuning.qwen_anchor_gpu_memory_utilization, 0.66)
+        self.assertEqual(tuning.qwen_anchor_batch_size, 3)
+        self.assertEqual(tuning.gemini_api_mode, "batch")
+        self.assertEqual(tuning.gemini_batch_chunk_size, 16)
 
     def test_invalid_mode_raises(self) -> None:
         with patch.dict(os.environ, {"SGOCR_LOCATION_WORDING_MODE": "wild"}, clear=True):
             with self.assertRaises(ValueError):
                 load_semantic_dev40_tuning()
 
+    def test_invalid_ocr_frontend_raises(self) -> None:
+        with patch.dict(os.environ, {"SGOCR_OCR_FRONTEND": "mystery"}, clear=True):
+            with self.assertRaises(ValueError):
+                load_semantic_dev40_tuning()
+
+    def test_invalid_anchor_backend_raises(self) -> None:
+        with patch.dict(os.environ, {"SGOCR_ANCHOR_CANDIDATE_BACKEND": "mystery"}, clear=True):
+            with self.assertRaises(ValueError):
+                load_semantic_dev40_tuning()
+
+    def test_invalid_anchor_tag_backend_raises(self) -> None:
+        with patch.dict(os.environ, {"SGOCR_ANCHOR_TAG_DISCOVERY_BACKEND": "mystery"}, clear=True):
+            with self.assertRaises(ValueError):
+                load_semantic_dev40_tuning()
+
+    def test_invalid_qwen_tag_vocab_mode_raises(self) -> None:
+        with patch.dict(os.environ, {"SGOCR_QWEN_ANCHOR_TAG_DISCOVERY_VOCAB_MODE": "wild"}, clear=True):
+            with self.assertRaises(ValueError):
+                load_semantic_dev40_tuning()
+
     def test_invalid_text_merge_threshold_raises(self) -> None:
         with patch.dict(os.environ, {"SGOCR_TEXT_MERGE_SUBSUME_MIN_NODES": "1"}, clear=True):
+            with self.assertRaises(ValueError):
+                load_semantic_dev40_tuning()
+
+    def test_invalid_gemini_mode_raises(self) -> None:
+        with patch.dict(os.environ, {"SGOCR_GEMINI_API_MODE": "weird"}, clear=True):
             with self.assertRaises(ValueError):
                 load_semantic_dev40_tuning()
 

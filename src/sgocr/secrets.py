@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from typing import Iterable
 
 
 @dataclass(frozen=True)
@@ -33,3 +34,11 @@ def redact_secret(value: str | None) -> str:
     if not value:
         return "<missing>"
     return "***REDACTED***"
+
+
+def missing_secret_env_vars(specs: Iterable[SecretSpec]) -> list[str]:
+    missing: list[str] = []
+    for spec in specs:
+        if not os.environ.get(spec.env_var):
+            missing.append(spec.env_var)
+    return missing

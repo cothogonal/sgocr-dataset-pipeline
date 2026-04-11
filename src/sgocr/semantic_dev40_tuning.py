@@ -27,6 +27,10 @@ def _env_str(name: str, default: str) -> str:
 
 @dataclass(frozen=True)
 class SemanticDev40Tuning:
+    ocr_frontend: str = "classic"
+    anchor_tag_discovery_backend: str = "florence"
+    qwen_anchor_tag_discovery_vocab_mode: str = "constrained"
+    anchor_candidate_backend: str = "florence_dino"
     detector_mode: str = "ppocr"
     detector_box_thresh: float = 0.50
     detector_unclip_ratio: float = 1.50
@@ -61,12 +65,17 @@ class SemanticDev40Tuning:
     yesno_positive_specific_threshold: int = 3
     property_specific_threshold: int = 4
     max_negative_yesno_per_image: int = 1
+    anchor_type_soft_cap_count: int = 2
+    anchor_type_soft_cap_penalty: float = 0.15
     reverse_ground_directional_local_bias: float = 0.20
     reverse_ground_on_local_bias: float = 0.08
     reverse_ground_directional_mixed_bias: float = 0.10
     reverse_ground_on_mixed_bias: float = 0.06
     ambiguity_hard_reject_score: int = 5
     ambiguity_reverse_reject_score: int = 4
+    dr_ambiguity_reject_score: int = -1  # -1 = disabled; set to e.g. 5 to reject high-ambiguity DIRECT_READ
+    inline_frontier_enabled: bool = True
+    inline_frontier_model: str = "gemini-3-flash-preview"
     anchor_conflict_overlap: float = 0.78
     sam3_refine_mode: str = "none"
     sam3_apply_mode: str = "all"
@@ -80,6 +89,19 @@ class SemanticDev40Tuning:
     location_wording_mode: str = "balanced"
     avoid_redundant_location_phrases: bool = True
     teacher_strictness: str = "strict"
+    reverse_ground_answer_style: str = "standard"
+    anchor_relabel_generic_mode: str = "standard"
+    generic_anchor_retry_penalty: float = 0.10
+    qwen_anchor_model: str = "Qwen/Qwen3-VL-8B-Instruct-FP8"
+    qwen_anchor_gpu_memory_utilization: float = 0.90
+    qwen_anchor_batch_size: int = 2
+    qwen_anchor_min_pixels: int = 64 * 32 * 32
+    qwen_anchor_max_pixels: int = 9800 * 32 * 32
+    qwen_anchor_max_model_len: int = 2048
+    gemini_api_mode: str = "sync"
+    gemini_batch_chunk_size: int = 48
+    gemini_batch_poll_seconds: int = 15
+    gemini_batch_timeout_seconds: int = 7200
 
     def to_metadata(self) -> dict[str, float | int | str]:
         return asdict(self)
@@ -87,6 +109,10 @@ class SemanticDev40Tuning:
 
 def load_semantic_dev40_tuning() -> SemanticDev40Tuning:
     tuning = SemanticDev40Tuning(
+        ocr_frontend=_env_str("SGOCR_OCR_FRONTEND", "classic"),
+        anchor_tag_discovery_backend=_env_str("SGOCR_ANCHOR_TAG_DISCOVERY_BACKEND", "florence"),
+        qwen_anchor_tag_discovery_vocab_mode=_env_str("SGOCR_QWEN_ANCHOR_TAG_DISCOVERY_VOCAB_MODE", "constrained"),
+        anchor_candidate_backend=_env_str("SGOCR_ANCHOR_CANDIDATE_BACKEND", "florence_dino"),
         detector_mode=_env_str("SGOCR_DETECTOR_MODE", "ppocr"),
         detector_box_thresh=_env_float("SGOCR_DETECTOR_BOX_THRESH", 0.50),
         detector_unclip_ratio=_env_float("SGOCR_DETECTOR_UNCLIP_RATIO", 1.50),
@@ -121,12 +147,17 @@ def load_semantic_dev40_tuning() -> SemanticDev40Tuning:
         yesno_positive_specific_threshold=_env_int("SGOCR_YESNO_POSITIVE_SPECIFIC_THRESHOLD", 3),
         property_specific_threshold=_env_int("SGOCR_PROPERTY_SPECIFIC_THRESHOLD", 4),
         max_negative_yesno_per_image=_env_int("SGOCR_MAX_NEGATIVE_YESNO_PER_IMAGE", 1),
+        anchor_type_soft_cap_count=_env_int("SGOCR_ANCHOR_TYPE_SOFT_CAP_COUNT", 2),
+        anchor_type_soft_cap_penalty=_env_float("SGOCR_ANCHOR_TYPE_SOFT_CAP_PENALTY", 0.15),
         reverse_ground_directional_local_bias=_env_float("SGOCR_REVERSE_GROUND_DIRECTIONAL_LOCAL_BIAS", 0.20),
         reverse_ground_on_local_bias=_env_float("SGOCR_REVERSE_GROUND_ON_LOCAL_BIAS", 0.08),
         reverse_ground_directional_mixed_bias=_env_float("SGOCR_REVERSE_GROUND_DIRECTIONAL_MIXED_BIAS", 0.10),
         reverse_ground_on_mixed_bias=_env_float("SGOCR_REVERSE_GROUND_ON_MIXED_BIAS", 0.06),
         ambiguity_hard_reject_score=_env_int("SGOCR_AMBIGUITY_HARD_REJECT_SCORE", 5),
         ambiguity_reverse_reject_score=_env_int("SGOCR_AMBIGUITY_REVERSE_REJECT_SCORE", 4),
+        dr_ambiguity_reject_score=_env_int("SGOCR_DR_AMBIGUITY_REJECT_SCORE", -1),
+        inline_frontier_enabled=_env_int("SGOCR_INLINE_FRONTIER_ENABLED", 1) != 0,
+        inline_frontier_model=_env_str("SGOCR_INLINE_FRONTIER_MODEL", "gemini-3-flash-preview"),
         anchor_conflict_overlap=_env_float("SGOCR_ANCHOR_CONFLICT_OVERLAP", 0.78),
         sam3_refine_mode=_env_str("SGOCR_SAM3_REFINE_MODE", "none"),
         sam3_apply_mode=_env_str("SGOCR_SAM3_APPLY_MODE", "all"),
@@ -140,13 +171,42 @@ def load_semantic_dev40_tuning() -> SemanticDev40Tuning:
         location_wording_mode=_env_str("SGOCR_LOCATION_WORDING_MODE", "balanced"),
         avoid_redundant_location_phrases=_env_int("SGOCR_AVOID_REDUNDANT_LOCATION_PHRASES", 1) != 0,
         teacher_strictness=_env_str("SGOCR_TEACHER_STRICTNESS", "strict"),
+        reverse_ground_answer_style=_env_str("SGOCR_REVERSE_GROUND_ANSWER_STYLE", "standard"),
+        anchor_relabel_generic_mode=_env_str("SGOCR_ANCHOR_RELABEL_GENERIC_MODE", "standard"),
+        generic_anchor_retry_penalty=_env_float("SGOCR_GENERIC_ANCHOR_RETRY_PENALTY", 0.10),
+        qwen_anchor_model=_env_str("SGOCR_QWEN_ANCHOR_MODEL", "Qwen/Qwen3-VL-8B-Instruct-FP8"),
+        qwen_anchor_gpu_memory_utilization=_env_float("SGOCR_QWEN_ANCHOR_GPU_MEMORY_UTILIZATION", 0.90),
+        qwen_anchor_batch_size=_env_int("SGOCR_QWEN_ANCHOR_BATCH_SIZE", 2),
+        qwen_anchor_min_pixels=_env_int("SGOCR_QWEN_ANCHOR_MIN_PIXELS", 64 * 32 * 32),
+        qwen_anchor_max_pixels=_env_int("SGOCR_QWEN_ANCHOR_MAX_PIXELS", 9800 * 32 * 32),
+        qwen_anchor_max_model_len=_env_int("SGOCR_QWEN_ANCHOR_MAX_MODEL_LEN", 2048),
+        gemini_api_mode=_env_str("SGOCR_GEMINI_API_MODE", "sync"),
+        gemini_batch_chunk_size=_env_int("SGOCR_GEMINI_BATCH_CHUNK_SIZE", 48),
+        gemini_batch_poll_seconds=_env_int("SGOCR_GEMINI_BATCH_POLL_SECONDS", 15),
+        gemini_batch_timeout_seconds=_env_int("SGOCR_GEMINI_BATCH_TIMEOUT_SECONDS", 7200),
     )
+    if tuning.ocr_frontend not in {"classic", "nemotron_v2"}:
+        raise ValueError(f"Unsupported SGOCR_OCR_FRONTEND: {tuning.ocr_frontend}")
+    if tuning.anchor_tag_discovery_backend not in {"florence", "qwen3_vl_vllm"}:
+        raise ValueError(f"Unsupported SGOCR_ANCHOR_TAG_DISCOVERY_BACKEND: {tuning.anchor_tag_discovery_backend}")
+    if tuning.qwen_anchor_tag_discovery_vocab_mode not in {"constrained", "open"}:
+        raise ValueError(
+            f"Unsupported SGOCR_QWEN_ANCHOR_TAG_DISCOVERY_VOCAB_MODE: {tuning.qwen_anchor_tag_discovery_vocab_mode}"
+        )
+    if tuning.anchor_candidate_backend not in {"florence_dino", "qwen3_vl_vllm"}:
+        raise ValueError(f"Unsupported SGOCR_ANCHOR_CANDIDATE_BACKEND: {tuning.anchor_candidate_backend}")
     if tuning.detector_mode not in {"ppocr", "ppocr_craft_ensemble"}:
         raise ValueError(f"Unsupported SGOCR_DETECTOR_MODE: {tuning.detector_mode}")
-    if tuning.location_wording_mode not in {"lite", "balanced", "varied"}:
+    if tuning.location_wording_mode not in {"lite", "balanced", "varied", "rich_local"}:
         raise ValueError(f"Unsupported SGOCR_LOCATION_WORDING_MODE: {tuning.location_wording_mode}")
+    if tuning.reverse_ground_answer_style not in {"standard", "frontier", "frontier_rich"}:
+        raise ValueError(f"Unsupported SGOCR_REVERSE_GROUND_ANSWER_STYLE: {tuning.reverse_ground_answer_style}")
+    if tuning.anchor_relabel_generic_mode not in {"standard", "anti_generic"}:
+        raise ValueError(f"Unsupported SGOCR_ANCHOR_RELABEL_GENERIC_MODE: {tuning.anchor_relabel_generic_mode}")
     if tuning.teacher_strictness not in {"strict", "very_strict"}:
         raise ValueError(f"Unsupported SGOCR_TEACHER_STRICTNESS: {tuning.teacher_strictness}")
+    if tuning.gemini_api_mode not in {"sync", "batch"}:
+        raise ValueError(f"Unsupported SGOCR_GEMINI_API_MODE: {tuning.gemini_api_mode}")
     if tuning.anchor_prompt_expansion_mode not in {"none", "supportive", "aggressive"}:
         raise ValueError(f"Unsupported SGOCR_ANCHOR_PROMPT_EXPANSION_MODE: {tuning.anchor_prompt_expansion_mode}")
     if tuning.anchor_relabel_mode not in {"none", "flash", "pro"}:
@@ -207,4 +267,26 @@ def load_semantic_dev40_tuning() -> SemanticDev40Tuning:
         raise ValueError("SGOCR_SAM3_TARGET_AREA_START must be > 0")
     if tuning.max_negative_yesno_per_image < 0:
         raise ValueError("SGOCR_MAX_NEGATIVE_YESNO_PER_IMAGE must be >= 0")
+    if tuning.anchor_type_soft_cap_count < 0:
+        raise ValueError("SGOCR_ANCHOR_TYPE_SOFT_CAP_COUNT must be >= 0")
+    if tuning.anchor_type_soft_cap_penalty < 0.0:
+        raise ValueError("SGOCR_ANCHOR_TYPE_SOFT_CAP_PENALTY must be >= 0")
+    if tuning.generic_anchor_retry_penalty < 0.0:
+        raise ValueError("SGOCR_GENERIC_ANCHOR_RETRY_PENALTY must be >= 0")
+    if not 0.0 < tuning.qwen_anchor_gpu_memory_utilization < 1.0:
+        raise ValueError("SGOCR_QWEN_ANCHOR_GPU_MEMORY_UTILIZATION must be in (0,1)")
+    if tuning.qwen_anchor_batch_size <= 0:
+        raise ValueError("SGOCR_QWEN_ANCHOR_BATCH_SIZE must be > 0")
+    if tuning.qwen_anchor_min_pixels <= 0 or tuning.qwen_anchor_max_pixels <= 0:
+        raise ValueError("SGOCR_QWEN_ANCHOR_MIN_PIXELS and MAX_PIXELS must be > 0")
+    if tuning.qwen_anchor_min_pixels > tuning.qwen_anchor_max_pixels:
+        raise ValueError("SGOCR_QWEN_ANCHOR_MIN_PIXELS must be <= MAX_PIXELS")
+    if tuning.qwen_anchor_max_model_len <= 0:
+        raise ValueError("SGOCR_QWEN_ANCHOR_MAX_MODEL_LEN must be > 0")
+    if tuning.gemini_batch_chunk_size <= 0:
+        raise ValueError("SGOCR_GEMINI_BATCH_CHUNK_SIZE must be > 0")
+    if tuning.gemini_batch_poll_seconds <= 0:
+        raise ValueError("SGOCR_GEMINI_BATCH_POLL_SECONDS must be > 0")
+    if tuning.gemini_batch_timeout_seconds <= 0:
+        raise ValueError("SGOCR_GEMINI_BATCH_TIMEOUT_SECONDS must be > 0")
     return tuning

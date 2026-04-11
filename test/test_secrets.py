@@ -1,7 +1,7 @@
 import os
 import unittest
 
-from sgocr.secrets import ANTHROPIC, GEMINI, OPENAI, MissingSecretError, get_secret, redact_secret
+from sgocr.secrets import ANTHROPIC, GEMINI, OPENAI, MissingSecretError, get_secret, missing_secret_env_vars, redact_secret
 
 
 class TestSecrets(unittest.TestCase):
@@ -40,6 +40,20 @@ class TestSecrets(unittest.TestCase):
         self.assertEqual(GEMINI.env_var, "GEMINI_API_KEY")
         self.assertEqual(OPENAI.env_var, "OPENAI_API_KEY")
         self.assertEqual(ANTHROPIC.env_var, "ANTHROPIC_API_KEY")
+
+    def test_missing_secret_env_vars_reports_only_missing_names(self) -> None:
+        saved_gemini = os.environ.pop("GEMINI_API_KEY", None)
+        saved_openai = os.environ.get("OPENAI_API_KEY")
+        os.environ["OPENAI_API_KEY"] = "present"
+        try:
+            self.assertEqual(missing_secret_env_vars([GEMINI, OPENAI]), ["GEMINI_API_KEY"])
+        finally:
+            if saved_gemini is not None:
+                os.environ["GEMINI_API_KEY"] = saved_gemini
+            if saved_openai is None:
+                os.environ.pop("OPENAI_API_KEY", None)
+            else:
+                os.environ["OPENAI_API_KEY"] = saved_openai
 
 
 if __name__ == "__main__":

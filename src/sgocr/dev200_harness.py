@@ -5,7 +5,7 @@ from pathlib import Path
 
 from .bootstrap import build_and_write_dev_subset
 from .bootstrap_kd import materialize_bootstrap_kd_dataset
-from .dev200_eval import compute_frontier_agreement, prepare_bundle_evals, run_frontier_benchmark
+from .dev200_eval import _load_jsonl, _write_frontier_eval_index, compute_frontier_agreement, prepare_bundle_evals, run_frontier_benchmark
 from .dev40_complete import build_dev40_complete_dataset
 from .full_pipeline_dev40 import build_dev40_semantic_dataset
 from .paths import OCR_SPATIAL_QA_FINAL_ROOT, OCR_SPATIAL_QA_INTERMEDIATE_ROOT, OCR_SPATIAL_QA_RAW_ROOT
@@ -77,6 +77,10 @@ def parse_args() -> argparse.Namespace:
 
     ap_agree = sub.add_parser("compute-frontier-agreement")
     ap_agree.add_argument("--benchmark-dir", required=True)
+
+    ap_backfill = sub.add_parser("backfill-frontier-evals-index", help="Rebuild frontier_evals_index.jsonl from existing evals/ dirs.")
+    ap_backfill.add_argument("--experiment-dir", required=True, help="Path to a final experiment directory.")
+
     return ap.parse_args()
 
 
@@ -179,6 +183,15 @@ def main() -> None:
 
     if args.cmd == "compute-frontier-agreement":
         compute_frontier_agreement(benchmark_dir=Path(args.benchmark_dir))
+        return
+
+    if args.cmd == "backfill-frontier-evals-index":
+        experiment_dir = Path(args.experiment_dir)
+        all_preds: list[dict] = []
+        for pred_file in sorted((experiment_dir / "evals").glob("*/predictions.jsonl")):
+            all_preds.extend(_load_jsonl(pred_file))
+        _write_frontier_eval_index(experiment_dir, all_preds)
+        print(f"Wrote frontier_evals_index.jsonl to {experiment_dir} ({len(all_preds)} prediction rows from {experiment_dir / 'evals'})")
         return
 
     out_dir = Path(args.out_dir) if args.out_dir else (OCR_SPATIAL_QA_FINAL_ROOT / "dev200" / args.name)

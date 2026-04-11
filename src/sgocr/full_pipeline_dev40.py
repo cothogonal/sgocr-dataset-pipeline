@@ -15,6 +15,7 @@ from .bootstrap import REGION_PHRASES, REGION_SYNONYMS, area_bucket, density_buc
 from .bootstrap_kd import bbox_xywh_to_xyxy, bbox_xyxy_to_xywh, compute_resolvability, overlap_fraction
 from .consensus import OCRVote, choose_consensus
 from .dev40_complete import (
+    annotate_inline_frontier,
     build_question_candidates,
     enforce_type_constraints,
     row_to_final_sample,
@@ -24,12 +25,20 @@ from .dev40_complete import (
     union_bbox,
 )
 from .ocr_runtime import CraftDetector, PARSeqRecognizer, PaddleOCRDetector, PaddleOCRRecognizer, TrOCRRecognizer, bbox_to_polygon, crop_with_padding
+from .nemotron_frontend import run_nemotron_ocr_stage
+from .qwen_anchor_vllm import (
+    OPEN_QWEN_LOCAL_DISCOVERY_PROMPT,
+    QwenAnchorGrounderVLLM,
+    QwenAnchorRequest,
+    normalize_qwen_description,
+)
 from .semantic_dev40_tuning import load_semantic_dev40_tuning
 from .semantic_grounding import (
     FlorenceTagger,
     FALLBACK_TAGS,
     GeminiAnchorRelabeler,
     GroundingDinoGrounder,
+    QWEN_LOCAL_DISCOVERY_CATEGORIES,
     Sam3Refiner,
     SAFE_FALLBACK_TAGS,
     GENERIC_TEXT_ANCHORS,
@@ -48,10 +57,14 @@ from .semantic_grounding import (
     local_text_location_metadata,
     relation_between_text_and_anchor,
 )
+from .run_quality import compute_run_quality
 
 SEMANTIC_PROMPT_VARIANT = "semantic_dev40_v8"
 RUNTIME_MODELS = {
     "pipeline_logic": SEMANTIC_PROMPT_VARIANT,
+    "ocr_frontend": "classic",
+    "anchor_tag_discovery_backend": "florence",
+    "anchor_candidate_backend": "florence_dino",
     "detector": "PP-OCRv5_server_det",
     "recognizers": ["parseq", "PP-OCRv5_server_rec", "microsoft/trocr-large-printed"],
     "semantic_tagger": "microsoft/Florence-2-large",
@@ -61,6 +74,7 @@ RUNTIME_MODELS = {
 
 def _ocr_runtime_signature(runtime_models: dict[str, Any]) -> dict[str, Any]:
     return {
+        "ocr_frontend": runtime_models.get("ocr_frontend", "classic"),
         "detector": runtime_models.get("detector"),
         "recognizers": runtime_models.get("recognizers"),
     }
@@ -70,6 +84,8 @@ def _semantic_runtime_signature(runtime_models: dict[str, Any]) -> dict[str, Any
     return {
         "semantic_tagger": runtime_models.get("semantic_tagger"),
         "grounder": runtime_models.get("grounder"),
+        "anchor_tag_discovery_backend": runtime_models.get("anchor_tag_discovery_backend", "florence"),
+        "anchor_candidate_backend": runtime_models.get("anchor_candidate_backend", "florence_dino"),
     }
 
 
@@ -477,8 +493,12 @@ def _is_valid_merged_answer(answer: str, *, node_count: int) -> bool:
 
 def _order_component_nodes(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
     orientation = _component_orientation(nodes)
-    if orientation == "horizontal":
-        return sorted(nodes, key=lambda row: (_box_center(list(row["bbox"]))[0], _box_center(list(row["bbox"]))[1]))
+    def x_then_y(row: dict[str, Any]) -> tuple[float, float]:
+        cx, cy = _box_center(list(row["bbox"]))
+        return (cx, cy)
+
+    if orientation in {"horizontal", "mixed"}:
+        return sorted(nodes, key=x_then_y)
     return sorted(nodes, key=lambda row: (_box_center(list(row["bbox"]))[1], _box_center(list(row["bbox"]))[0]))
 
 
@@ -721,6 +741,11 @@ def build_dev40_semantic_dataset(
 ) -> dict[str, Any]:
     tuning = load_semantic_dev40_tuning()
     runtime_models = dict(RUNTIME_MODELS)
+    runtime_models["ocr_frontend"] = tuning.ocr_frontend
+    runtime_models["anchor_tag_discovery_backend"] = tuning.anchor_tag_discovery_backend
+    runtime_models["anchor_candidate_backend"] = tuning.anchor_candidate_backend
+    if tuning.anchor_candidate_backend == "qwen3_vl_vllm" or tuning.anchor_tag_discovery_backend == "qwen3_vl_vllm":
+        runtime_models["grounder"] = tuning.qwen_anchor_model
     if tuning.sam3_refine_mode != "none":
         runtime_models["sam3_refiner"] = "facebook/sam3"
     image_specs, image_source_map = load_image_specs(source_experiment_dir)
@@ -804,51 +829,62 @@ def build_dev40_semantic_dataset(
                     "cache_reused": True,
                 }
     else:
-        detections_by_image, detection_rows, detection_summary = run_detection_stage(
-            image_specs=image_specs,
-            device=runtime_device,
-            max_detections=max_detections,
-        )
-        write_jsonl(intermediate_dir / "text_detections.jsonl", detection_rows)
+        if tuning.ocr_frontend == "nemotron_v2":
+            detections_by_image, detection_rows, detection_summary, text_nodes, consensus_stats = run_nemotron_ocr_stage(
+                image_specs=image_specs,
+                image_source_map=image_source_map,
+                max_detections=max_detections,
+            )
+            write_jsonl(intermediate_dir / "text_detections.jsonl", detection_rows)
+            write_jsonl(intermediate_dir / "text_nodes.jsonl", text_nodes)
+            write_json(intermediate_dir / "consensus_stats.json", consensus_stats)
+        else:
+            detections_by_image, detection_rows, detection_summary = run_detection_stage(
+                image_specs=image_specs,
+                device=runtime_device,
+                max_detections=max_detections,
+            )
+            write_jsonl(intermediate_dir / "text_detections.jsonl", detection_rows)
 
-        parseq_rows = run_recognition_stage(
-            image_specs=image_specs,
-            detections_by_image=detections_by_image,
-            recognizer=PARSeqRecognizer(device=runtime_device),
-            model_key="parseq",
-        )
-        write_jsonl(intermediate_dir / "parseq_readings.jsonl", parseq_rows)
+            parseq_rows = run_recognition_stage(
+                image_specs=image_specs,
+                detections_by_image=detections_by_image,
+                recognizer=PARSeqRecognizer(device=runtime_device),
+                model_key="parseq",
+            )
+            write_jsonl(intermediate_dir / "parseq_readings.jsonl", parseq_rows)
 
-        ppocr_server_rows = run_recognition_stage(
-            image_specs=image_specs,
-            detections_by_image=detections_by_image,
-            recognizer=PaddleOCRRecognizer("PP-OCRv5_server_rec", device=runtime_device),
-            model_key="ppocrv5_server",
-        )
-        write_jsonl(intermediate_dir / "ppocrv5_server_readings.jsonl", ppocr_server_rows)
+            ppocr_server_rows = run_recognition_stage(
+                image_specs=image_specs,
+                detections_by_image=detections_by_image,
+                recognizer=PaddleOCRRecognizer("PP-OCRv5_server_rec", device=runtime_device),
+                model_key="ppocrv5_server",
+            )
+            write_jsonl(intermediate_dir / "ppocrv5_server_readings.jsonl", ppocr_server_rows)
 
-        trocr_large_rows = run_recognition_stage(
-            image_specs=image_specs,
-            detections_by_image=detections_by_image,
-            recognizer=TrOCRRecognizer("microsoft/trocr-large-printed", device=runtime_device),
-            model_key="trocr_large",
-        )
-        write_jsonl(intermediate_dir / "trocr_large_readings.jsonl", trocr_large_rows)
-        if runtime_device.startswith("cuda") and torch.cuda.is_available():
-            torch.cuda.empty_cache()
+            trocr_large_rows = run_recognition_stage(
+                image_specs=image_specs,
+                detections_by_image=detections_by_image,
+                recognizer=TrOCRRecognizer("microsoft/trocr-large-printed", device=runtime_device),
+                model_key="trocr_large",
+            )
+            write_jsonl(intermediate_dir / "trocr_large_readings.jsonl", trocr_large_rows)
+            if runtime_device.startswith("cuda") and torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
-        text_nodes, consensus_stats = build_consensus_nodes(
-            image_specs=image_specs,
-            image_source_map=image_source_map,
-            detections_by_image=detections_by_image,
-            reading_rows=parseq_rows + ppocr_server_rows + trocr_large_rows,
-        )
-        write_jsonl(intermediate_dir / "text_nodes.jsonl", text_nodes)
-        write_json(intermediate_dir / "consensus_stats.json", consensus_stats)
+            text_nodes, consensus_stats = build_consensus_nodes(
+                image_specs=image_specs,
+                image_source_map=image_source_map,
+                detections_by_image=detections_by_image,
+                reading_rows=parseq_rows + ppocr_server_rows + trocr_large_rows,
+            )
+            write_jsonl(intermediate_dir / "text_nodes.jsonl", text_nodes)
+            write_json(intermediate_dir / "consensus_stats.json", consensus_stats)
 
     write_json(intermediate_dir / "runtime_models.json", runtime_models)
 
-    text_nodes = recompute_text_node_resolvability(text_nodes)
+    if tuning.ocr_frontend != "nemotron_v2":
+        text_nodes = recompute_text_node_resolvability(text_nodes)
     write_jsonl(intermediate_dir / "text_nodes.jsonl", text_nodes)
 
     resolvable_nodes = [node for node in text_nodes if node["resolvable"]]
@@ -940,6 +976,13 @@ def build_dev40_semantic_dataset(
         else:
             failure_counts[row.get("failure_reason") or "validation_failed"] += 1
 
+    inline_frontier_summary = annotate_inline_frontier(
+        final_rows,
+        model=str(load_semantic_dev40_tuning().inline_frontier_model),
+        max_side=max_side,
+        workers=workers,
+    )
+
     write_jsonl(out_dir / "raw_results.jsonl", raw_results)
     write_jsonl(out_dir / "ocr_qa_dataset.jsonl", final_rows)
     write_jsonl(out_dir / "accepted_dataset.jsonl", final_rows)
@@ -995,7 +1038,20 @@ def build_dev40_semantic_dataset(
         "detection_summary": detection_summary,
         "mean_question_words": statistics.mean(len(str(row["question"]).split()) for row in final_rows) if final_rows else 0.0,
         "images_with_final_rows": len({row["image_id"] for row in final_rows}),
+        "inline_frontier": inline_frontier_summary,
     }
+    quality_metrics = compute_run_quality(summary, final_rows)
+    summary.update(
+        {
+            "accepted_rows": int(quality_metrics["accepted_qas"]),
+            "inline_frontier_mean": float(quality_metrics["inline_frontier_mean"]),
+            "inline_frontier_scored": int(quality_metrics["inline_frontier_scored"]),
+            "precision_first_score": float(quality_metrics["precision_first_score"]),
+            "sweep_score": float(quality_metrics["sweep_score"]),
+            "q3": float(quality_metrics["q3_score"]),
+            "quality_score": float(quality_metrics["quality_score"]),
+        }
+    )
     write_json(out_dir / "summary.json", summary)
     return summary
 
@@ -1263,9 +1319,24 @@ def run_anchor_stage(
     max_tags_per_image: int,
     grounding_threshold: float,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[tuple[str, str], dict[str, Any]]]:
-    tagger = FlorenceTagger(model_name=str(RUNTIME_MODELS["semantic_tagger"]), device=device)
-    grounder = GroundingDinoGrounder(device=device)
-    sam3_refiner = Sam3Refiner(device=device, confidence_threshold=load_semantic_dev40_tuning().sam3_confidence_threshold) if _sam3_prompt_limit() > 0 else None
+    tuning = load_semantic_dev40_tuning()
+    use_qwen_tag_backend = tuning.anchor_tag_discovery_backend == "qwen3_vl_vllm"
+    use_qwen_anchor_backend = tuning.anchor_candidate_backend == "qwen3_vl_vllm"
+    tagger = None if use_qwen_tag_backend else FlorenceTagger(model_name=str(RUNTIME_MODELS["semantic_tagger"]), device=device)
+    grounder = None if use_qwen_anchor_backend else GroundingDinoGrounder(device=device)
+    qwen_grounder = (
+        QwenAnchorGrounderVLLM(
+            model_name=str(tuning.qwen_anchor_model),
+            gpu_memory_utilization=float(tuning.qwen_anchor_gpu_memory_utilization),
+            batch_size=int(tuning.qwen_anchor_batch_size),
+            min_pixels=int(tuning.qwen_anchor_min_pixels),
+            max_pixels=int(tuning.qwen_anchor_max_pixels),
+            max_model_len=int(tuning.qwen_anchor_max_model_len),
+        )
+        if use_qwen_anchor_backend or use_qwen_tag_backend
+        else None
+    )
+    sam3_refiner = Sam3Refiner(device=device, confidence_threshold=tuning.sam3_confidence_threshold) if _sam3_prompt_limit() > 0 else None
     nodes_by_image: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for node in resolvable_nodes:
         nodes_by_image[str(node["image_id"])].append(node)
@@ -1273,7 +1344,7 @@ def run_anchor_stage(
     anchor_tag_rows: list[dict[str, Any]] = []
     grounded_anchor_rows: list[dict[str, Any]] = []
     best_anchor_by_node: dict[tuple[str, str], dict[str, Any]] = {}
-    tuning = load_semantic_dev40_tuning()
+    image_plans: list[dict[str, Any]] = []
 
     for spec in image_specs:
         image_nodes = nodes_by_image.get(spec["image_id"], [])
@@ -1285,9 +1356,27 @@ def run_anchor_stage(
             for node in image_nodes
         ]
         context_crops = [image.crop(tuple(box)) for box in context_boxes]
-        descriptions = tagger.describe_batch(context_crops)
+        if use_qwen_tag_backend:
+            local_vocab_mode = tuning.qwen_anchor_tag_discovery_vocab_mode
+            qwen_tag_requests = [
+                QwenAnchorRequest(
+                    image_id=f"{spec['image_id']}::{node['node_id']}",
+                    image_obj=crop,
+                    categories=list(QWEN_LOCAL_DISCOVERY_CATEGORIES) if local_vocab_mode == "constrained" else [],
+                    prompt_text=None if local_vocab_mode == "constrained" else OPEN_QWEN_LOCAL_DISCOVERY_PROMPT,
+                    enforce_allowed_labels=local_vocab_mode == "constrained",
+                )
+                for node, crop in zip(image_nodes, context_crops)
+            ]
+            qwen_tag_rows = qwen_grounder.detect_many(qwen_tag_requests) if qwen_grounder is not None else {}
+            descriptions = [
+                normalize_qwen_description(qwen_tag_rows.get(f"{spec['image_id']}::{node['node_id']}", []))
+                for node in image_nodes
+            ]
+        else:
+            descriptions = tagger.describe_batch(context_crops)
         per_node_tags: dict[str, list[str]] = {}
-        per_node_florence_candidates: dict[str, list[dict[str, Any]]] = {}
+        per_node_local_candidates: dict[str, list[dict[str, Any]]] = {}
         image_tag_pool: list[str] = []
         for node, context_box, description in zip(image_nodes, context_boxes, descriptions):
             caption = str(description.get("caption") or "")
@@ -1325,7 +1414,7 @@ def run_anchor_stage(
             )
             combined_tags = list(dict.fromkeys(tags[:6] + expanded_tags))
             per_node_tags[str(node["node_id"])] = combined_tags[:8]
-            per_node_florence_candidates[str(node["node_id"])] = dedupe_anchor_rows(semantic_regions)
+            per_node_local_candidates[str(node["node_id"])] = dedupe_anchor_rows(semantic_regions)
             image_tag_pool.extend(combined_tags[:8])
             anchor_tag_rows.append(
                 {
@@ -1349,17 +1438,50 @@ def run_anchor_stage(
             if len(selected_tags) >= max_tags_per_image:
                 break
         selected_tags = selected_tags[:max_tags_per_image]
+        image_plans.append(
+            {
+                "spec": spec,
+                "image_nodes": image_nodes,
+                "image_size": (image.width, image.height),
+                "selected_tags": selected_tags,
+                "per_node_tags": per_node_tags,
+                "per_node_local_candidates": per_node_local_candidates,
+            }
+        )
 
-        image_anchors: list[dict[str, Any]] = []
-        for tag in selected_tags:
-            image_anchors.extend(grounder.detect(image, tag, threshold=grounding_threshold))
-        image_anchors = dedupe_anchor_rows(image_anchors)
+    image_anchors_by_image: dict[str, list[dict[str, Any]]] = {}
+    if qwen_grounder is not None:
+        qwen_requests = [
+            QwenAnchorRequest(
+                image_id=str(plan["spec"]["image_id"]),
+                image_path=str(plan["spec"]["image_path"]),
+                categories=list(plan["selected_tags"]),
+            )
+            for plan in image_plans
+        ]
+        image_anchors_by_image = {
+            image_id: dedupe_anchor_rows(rows)
+            for image_id, rows in qwen_grounder.detect_many(qwen_requests).items()
+        }
+    elif grounder is not None:
+        for plan in image_plans:
+            image = Image.open(plan["spec"]["image_path"]).convert("RGB")
+            image_anchors: list[dict[str, Any]] = []
+            for tag in plan["selected_tags"]:
+                image_anchors.extend(grounder.detect(image, tag, threshold=grounding_threshold))
+            image_anchors_by_image[str(plan["spec"]["image_id"])] = dedupe_anchor_rows(image_anchors)
+
+    for plan in image_plans:
+        spec = plan["spec"]
+        image_nodes = plan["image_nodes"]
+        image = Image.open(spec["image_path"]).convert("RGB")
+        image_anchors = image_anchors_by_image.get(str(spec["image_id"]), [])
         if sam3_refiner is not None:
             sam3_refiner.set_image(image)
 
         for node in image_nodes:
             candidates = []
-            for anchor in per_node_florence_candidates.get(str(node["node_id"]), []):
+            for anchor in plan["per_node_local_candidates"].get(str(node["node_id"]), []):
                 if not anchor_candidate_viable(str(anchor["label"]), list(anchor["box"]), list(node["bbox"]), (image.width, image.height)):
                     continue
                 relation = relation_between_text_and_anchor(list(node["bbox"]), list(anchor["box"]), (image.width, image.height))
@@ -1372,8 +1494,8 @@ def run_anchor_stage(
                         "relation": relation,
                         "relevance": round(float(relevance), 6),
                         "caption": next((row["caption"] for row in anchor_tag_rows if row["image_id"] == spec["image_id"] and row["node_id"] == node["node_id"]), None),
-                        "discovered_tags": per_node_tags.get(str(node["node_id"]), []),
-                        "final_prompt_tags": per_node_tags.get(str(node["node_id"]), []),
+                        "discovered_tags": plan["per_node_tags"].get(str(node["node_id"]), []),
+                        "final_prompt_tags": plan["per_node_tags"].get(str(node["node_id"]), []),
                     }
                 )
             for anchor in image_anchors:
@@ -1389,8 +1511,8 @@ def run_anchor_stage(
                         "relation": relation,
                         "relevance": round(float(relevance), 6),
                         "caption": next((row["caption"] for row in anchor_tag_rows if row["image_id"] == spec["image_id"] and row["node_id"] == node["node_id"]), None),
-                        "discovered_tags": per_node_tags.get(str(node["node_id"]), []),
-                        "final_prompt_tags": per_node_tags.get(str(node["node_id"]), []),
+                        "discovered_tags": plan["per_node_tags"].get(str(node["node_id"]), []),
+                        "final_prompt_tags": plan["per_node_tags"].get(str(node["node_id"]), []),
                     }
                 )
             filtered_candidates = [
@@ -1405,7 +1527,7 @@ def run_anchor_stage(
             if sam3_refiner is not None and _should_run_sam3_for_node(seed_candidates=filtered_candidates, node=node, image_size=(image.width, image.height)):
                 sam3_prompts = _select_sam3_prompts(
                     seed_candidates=filtered_candidates,
-                    node_tags=per_node_tags.get(str(node["node_id"]), []),
+                    node_tags=plan["per_node_tags"].get(str(node["node_id"]), []),
                     limit=_sam3_prompt_limit(),
                 )
                 sam3_rows: list[dict[str, Any]] = []
@@ -1423,8 +1545,8 @@ def run_anchor_stage(
                                 "relation": relation,
                                 "relevance": round(float(relevance), 6),
                                 "caption": next((row["caption"] for row in anchor_tag_rows if row["image_id"] == spec["image_id"] and row["node_id"] == node["node_id"]), None),
-                                "discovered_tags": per_node_tags.get(str(node["node_id"]), []),
-                                "final_prompt_tags": per_node_tags.get(str(node["node_id"]), []),
+                                "discovered_tags": plan["per_node_tags"].get(str(node["node_id"]), []),
+                                "final_prompt_tags": plan["per_node_tags"].get(str(node["node_id"]), []),
                             }
                         )
                 filtered_candidates.extend(sam3_rows)
@@ -1442,8 +1564,12 @@ def run_anchor_stage(
                 best_anchor_by_node[(spec["image_id"], str(node["node_id"]))] = filtered_candidates[0]
     if sam3_refiner is not None:
         sam3_refiner.close()
-    grounder.close()
-    tagger.close()
+    if grounder is not None:
+        grounder.close()
+    if qwen_grounder is not None:
+        qwen_grounder.close()
+    if tagger is not None:
+        tagger.close()
     return anchor_tag_rows, grounded_anchor_rows, best_anchor_by_node
 
 
@@ -1627,11 +1753,13 @@ def refine_anchor_labels(
 ) -> list[dict[str, Any]]:
     if not tuple_rows:
         return tuple_rows
+    tuning = load_semantic_dev40_tuning()
     grouped_rows = _cluster_relabel_groups(tuple_rows)
     relabeler = GeminiAnchorRelabeler(model_name=model_name)
     updated_rows = list(tuple_rows)
     by_id = {id(row): row for row in updated_rows}
-    for group_rows in grouped_rows:
+    pending_groups: list[dict[str, Any]] = []
+    for group_index, group_rows in enumerate(grouped_rows, start=1):
         if not _needs_anchor_relabel(group_rows):
             continue
         anchor_box = list(group_rows[0]["anchor_box"])
@@ -1657,21 +1785,52 @@ def refine_anchor_labels(
                 label_text = sanitize_anchor_label(str(label or ""))
                 if label_text and label_text not in candidate_labels:
                     candidate_labels.append(label_text)
-        try:
-            relabel = relabeler.relabel(
-                crop,
-                current_label=current_label,
-                candidate_labels=candidate_labels,
-                example_texts=example_texts,
-                relation=relation,
-            )
-        except Exception as exc:
-            relabel = {
+        pending_groups.append(
+            {
+                "key": f"group_{group_index}",
+                "group_rows": group_rows,
+                "image_crop": crop,
+                "current_label": current_label,
+                "candidate_labels": candidate_labels,
+                "example_texts": example_texts,
+                "relation": relation,
+            }
+        )
+
+    relabel_results: dict[str, dict[str, Any]] = {}
+    if pending_groups and tuning.gemini_api_mode == "batch":
+        relabel_results = relabeler.relabel_many(
+            pending_groups,
+            chunk_size=int(tuning.gemini_batch_chunk_size),
+            poll_interval_s=int(tuning.gemini_batch_poll_seconds),
+            timeout_s=int(tuning.gemini_batch_timeout_seconds),
+        )
+
+    for pending in pending_groups:
+        current_label = str(pending["current_label"])
+        if tuning.gemini_api_mode == "batch":
+            relabel = relabel_results.get(str(pending["key"])) or {
                 "label": current_label,
                 "alternates": [current_label],
                 "usage": {},
-                "raw_text": f"relabel_failed: {exc}",
+                "raw_text": "relabel_failed: missing batch response",
             }
+        else:
+            try:
+                relabel = relabeler.relabel(
+                    pending["image_crop"],
+                    current_label=current_label,
+                    candidate_labels=list(pending["candidate_labels"]),
+                    example_texts=list(pending["example_texts"]),
+                    relation=str(pending["relation"]),
+                )
+            except Exception as exc:
+                relabel = {
+                    "label": current_label,
+                    "alternates": [current_label],
+                    "usage": {},
+                    "raw_text": f"relabel_failed: {exc}",
+                }
 
         new_label = sanitize_anchor_label(str(relabel.get("label") or "")) or current_label
         new_synonyms = []
@@ -1679,7 +1838,7 @@ def refine_anchor_labels(
             cleaned = sanitize_anchor_label(str(label or ""))
             if cleaned and cleaned not in new_synonyms:
                 new_synonyms.append(cleaned)
-        for row in group_rows:
+        for row in pending["group_rows"]:
             debug = dict(row.get("semantic_debug") or {})
             debug["anchor_relabel"] = {
                 "model": model_name,

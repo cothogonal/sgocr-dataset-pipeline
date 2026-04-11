@@ -215,6 +215,52 @@ describe("review loader", () => {
     expect(loaded.samples[1]?.failureReason).toBe("direct_read_location_missing");
   });
 
+  test("recursively discovers experiments under the broader final root", () => {
+    const root = mkFixtureRepo();
+    const nestedExpDir = path.join(root, "data", "ocr_spatial_qa", "final", "mixed_dev150", "fixture_nested");
+    fs.mkdirSync(nestedExpDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(nestedExpDir, "summary.json"),
+      JSON.stringify({
+        experiment: {
+          provider: "gemini",
+          model: "gemini-2.5-flash",
+          prompt_variant: "semantic_dev40_v8",
+        },
+        stage_counts: { final_qa_rows: 2 },
+        accepted_qas: 2,
+      }),
+    );
+    fs.writeFileSync(
+      path.join(nestedExpDir, "ocr_qa_dataset.jsonl"),
+      JSON.stringify({
+        image_id: "img-2",
+        ann_id: "img-2_0",
+        image_path: "data/images/example.jpg",
+        answer: "WORLD",
+        question: "What text is here?",
+        anchor_label: "center area of the image",
+        relation: "in",
+        text_polygon: [10, 10, 20, 10, 20, 20, 10, 20],
+        text_bbox: [10, 10, 10, 10],
+        kd_metadata: { neighboring_text: [], nearby_anchors: [], competing_tuples: 0, image_size: [90, 60] },
+        resolvable: true,
+      }) + "\n",
+    );
+
+    const options = {
+      repoRoot: root,
+      dataRoot: path.join(root, "data"),
+      experimentsRoot: path.join(root, "data", "ocr_spatial_qa", "final"),
+    };
+    const experiments = listExperiments(options);
+    expect(experiments.map((entry) => entry.name)).toEqual(["dev200/fixture_exp", "mixed_dev150/fixture_nested"]);
+
+    const loaded = loadExperiment("mixed_dev150/fixture_nested", options);
+    expect(loaded.samples).toHaveLength(1);
+    expect(loaded.experiment?.name).toBe("mixed_dev150/fixture_nested");
+  });
+
   test("rejects image paths outside the data root", () => {
     const root = mkFixtureRepo();
     expect(() =>

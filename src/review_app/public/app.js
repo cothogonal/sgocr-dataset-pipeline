@@ -26,6 +26,8 @@ const els = {
   tupleJson: document.getElementById("tupleJson"),
   usageJson: document.getElementById("usageJson"),
   questionList: document.getElementById("questionList"),
+  frontierEvalsPanel: document.getElementById("frontierEvalsPanel"),
+  frontierEvalList: document.getElementById("frontierEvalList"),
   saveState: document.getElementById("saveState"),
   progressState: document.getElementById("progressState"),
   statusSummary: document.getElementById("statusSummary"),
@@ -275,6 +277,7 @@ function renderCurrentSample() {
   renderTupleSummary(sample);
   renderGroundingSummary(sample);
   renderQuestions(sample, audit);
+  renderFrontierEvals(sample);
   renderKDMetadata(sample);
   els.tupleJson.textContent = JSON.stringify(sample.tuple, null, 2);
   els.usageJson.textContent = JSON.stringify({ usage: sample.usage, summary: sample.summary, filterStage: sample.filterStage }, null, 2);
@@ -704,6 +707,42 @@ function renderQuestions(sample, audit) {
     els.questionList.appendChild(card);
   });
 }
+
+function renderFrontierEvals(sample) {
+  const evals = sample.frontierEvals || [];
+  els.frontierEvalsPanel.style.display = evals.length > 0 ? "" : "none";
+  els.frontierEvalList.innerHTML = "";
+  evals.forEach((ev) => {
+    const card = document.createElement("div");
+    card.className = "question-card";
+
+    const modelRow = document.createElement("div");
+    modelRow.className = "question-text";
+    modelRow.textContent = ev.model || "unknown model";
+
+    const predRow = document.createElement("div");
+    predRow.className = "answer-text";
+    predRow.textContent = ev.prediction ? "prediction: " + ev.prediction : "(no prediction)";
+
+    const badges = document.createElement("div");
+    badges.className = "badges";
+    const softLabel = ev.softCorrect ? "soft correct" : "soft wrong";
+    const softBadge = makeBadge(softLabel);
+    softBadge.style.background = ev.softCorrect ? "#4a7c4e" : "#7c4a4a";
+    softBadge.style.color = "#fff";
+    badges.append(
+      softBadge,
+      makeBadge("exact " + (ev.exactCorrect ? "yes" : "no")),
+      ev.wordF1 != null ? makeBadge("wf1 " + ev.wordF1.toFixed(2)) : null,
+    );
+    // Remove null badges
+    Array.from(badges.children).forEach((child) => { if (!child) badges.removeChild(child); });
+
+    card.append(modelRow, predRow, badges);
+    els.frontierEvalList.appendChild(card);
+  });
+}
+
 
 function renderKDMetadata(sample) {
   const kd = sample.tuple.kd_metadata || {};

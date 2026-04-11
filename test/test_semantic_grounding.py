@@ -10,6 +10,7 @@ from sgocr.semantic_grounding import (
     consolidate_anchor_candidates,
     expand_grounding_tags_for_node,
     extract_caption_tags,
+    is_generic_anchor_label,
     relation_between_text_and_anchor,
     sanitize_anchor_label,
     sanitize_anchor_tags,
@@ -34,6 +35,16 @@ class TestSemanticGrounding(unittest.TestCase):
         )
         self.assertEqual(sanitize_anchor_label("sign-covered wall behind the player"), "sign wall")
         self.assertIsNone(sanitize_anchor_label("No object detected"))
+
+    def test_sanitize_anchor_label_preserves_visible_color(self) -> None:
+        self.assertEqual(sanitize_anchor_label("bright red can on a shelf"), "bright red can")
+        self.assertEqual(sanitize_anchor_label("blue jersey with numbers"), "blue jersey")
+
+    def test_is_generic_anchor_label_flags_text_container_fallbacks(self) -> None:
+        self.assertTrue(is_generic_anchor_label("sign wall"))
+        self.assertTrue(is_generic_anchor_label("display panel"))
+        self.assertFalse(is_generic_anchor_label("red airplane tail"))
+        self.assertFalse(is_generic_anchor_label("silver car door"))
 
     def test_sanitize_anchor_tags_prefers_safe_nouns(self) -> None:
         tags = sanitize_anchor_tags(

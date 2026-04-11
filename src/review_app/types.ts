@@ -31,6 +31,18 @@ export type ReviewQuestion = {
   validation: ReviewValidation | null;
 };
 
+export type FrontierEvalResult = {
+  model: string;
+  provider: string | null;
+  prediction: string;
+  predictionNorm: string;
+  exactCorrect: boolean;
+  partialCorrect: boolean;
+  semanticCorrect: boolean;
+  softCorrect: boolean;
+  wordF1: number | null;
+};
+
 export type ReviewTupleGeometry = {
   textPolygon: Point[];
   textCentroid: Point | null;
@@ -58,6 +70,7 @@ export type ReviewSample = {
   tuple: Record<string, JsonValue>;
   geometry: ReviewTupleGeometry;
   questions: ReviewQuestion[];
+  frontierEvals: FrontierEvalResult[];
   usage: Record<string, JsonValue> | null;
   summary: Record<string, JsonValue> | null;
   filterStage: Record<string, JsonValue> | null;

@@ -34,6 +34,26 @@ class TestRunQuality(unittest.TestCase):
         self.assertAlmostEqual(metrics["anchor_missing_rate"], 0.2)
         self.assertAlmostEqual(metrics["quality_score"], 7.13)
 
+    def test_precision_first_score_uses_inline_frontier_correct(self) -> None:
+        summary = {
+            "accepted_qas": 4,
+            "generated_qas": 4,
+            "qa_accept_rate": 1.0,
+            "images_with_final_rows": 2,
+            "failure_counts": {},
+        }
+        rows = [
+            {"tags": {"question_type": "DIRECT_READ", "ambiguity_level": "low"}, "grounding": {}, "inline_frontier_correct": True},
+            {"tags": {"question_type": "YES_NO", "ambiguity_level": "low"}, "grounding": {}, "inline_frontier_correct": True},
+            {"tags": {"question_type": "REVERSE_GROUND", "ambiguity_level": "low"}, "grounding": {"reverse_ground_scope_preference": "local"}, "inline_frontier_correct": False},
+            {"tags": {"question_type": "TEXT_PROPERTY", "ambiguity_level": "low"}, "grounding": {}, "inline_frontier_correct": True},
+        ]
+        metrics = compute_run_quality(summary, rows)
+        self.assertEqual(metrics["inline_frontier_scored"], 4)
+        self.assertAlmostEqual(metrics["inline_frontier_mean"], 0.75)
+        self.assertAlmostEqual(metrics["precision_first_score"], 1.5)
+        self.assertAlmostEqual(metrics["sweep_score"], 1.5)
+
 
 if __name__ == "__main__":
     unittest.main()

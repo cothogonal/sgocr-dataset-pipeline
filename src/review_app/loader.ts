@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 
 import { boxFromPolygon, boxFromRegionKey, boxFromXYWH, boxFromXYXY, centroidFromBox, centroidFromPolygon, normalizePolygon, regionKeyFromLabel } from "./geometry";
-import type { ExperimentSummary, JsonValue, ReviewQuestion, ReviewSample, ReviewValidation } from "./types";
+import type { ExperimentSummary, FrontierEvalResult, JsonValue, ReviewQuestion, ReviewSample, ReviewValidation } from "./types";
 
 type LoaderOptions = {
   repoRoot: string;
@@ -14,19 +14,17 @@ export function listExperiments(options: LoaderOptions): ExperimentSummary[] {
   if (!fs.existsSync(options.experimentsRoot)) {
     return [];
   }
-  return fs
-    .readdirSync(options.experimentsRoot, { withFileTypes: true })
-    .filter((entry) => entry.isDirectory())
-    .map((entry) => {
-      const dirPath = path.join(options.experimentsRoot, entry.name);
+  return discoverExperimentDirs(options.experimentsRoot)
+    .map((dirPath) => {
       const summaryPath = path.join(dirPath, "summary.json");
       let summary: Record<string, JsonValue> = {};
       if (fs.existsSync(summaryPath)) {
         summary = JSON.parse(fs.readFileSync(summaryPath, "utf8"));
       }
       const experiment = asRecord(summary.experiment) || {};
+      const relativeName = path.relative(options.experimentsRoot, dirPath) || path.basename(dirPath);
       return {
-        name: entry.name,
+        name: relativeName,
         path: dirPath,
         sampleCount: asNumber(asRecord(summary.stage_counts)?.final_qa_rows) ?? asNumber(summary.tuple_count) ?? asNumber(summary.accepted_qas) ?? asNumber(summary.input_tuple_count),
         qaAcceptRate: asNumber(summary.qa_accept_rate),
@@ -52,6 +50,29 @@ export function listExperiments(options: LoaderOptions): ExperimentSummary[] {
     .sort((left, right) => left.name.localeCompare(right.name));
 }
 
+function discoverExperimentDirs(root: string): string[] {
+  const discovered: string[] = [];
+  const stack = [root];
+  const seen = new Set<string>();
+  while (stack.length > 0) {
+    const current = stack.pop();
+    if (!current || seen.has(current) || !fs.existsSync(current)) {
+      continue;
+    }
+    seen.add(current);
+    const datasetPath = primaryDatasetPath(current);
+    if (datasetPath) {
+      discovered.push(current);
+      continue;
+    }
+    for (const entry of fs.readdirSync(current, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue;
+      stack.push(path.join(current, entry.name));
+    }
+  }
+  return discovered;
+}
+
 export function loadExperiment(name: string, options: LoaderOptions): { experiment: ExperimentSummary | null; samples: ReviewSample[] } {
   const experiments = listExperiments(options);
   const experiment = experiments.find((entry) => entry.name === name) || null;
@@ -63,13 +84,14 @@ export function loadExperiment(name: string, options: LoaderOptions): { experime
     throw new Error(`No dataset file found for experiment: ${name}`);
   }
   const rawIndex = buildRawIndex(path.join(experiment.path, "raw_results.jsonl"));
+  const frontierEvalsIndex = buildFrontierEvalsIndex(experiment.path);
   const lines = fs
     .readFileSync(datasetPath, "utf8")
     .split(/\r?\n/)
     .map((line) => line.trim())
     .filter(Boolean);
   const acceptedRows = lines.map((line) => JSON.parse(line) as Record<string, JsonValue>);
-  const samples = acceptedRows.map((row, index) => normalizeReviewRow(row, index, options, rawIndex, "accepted"));
+  const samples = acceptedRows.map((row, index) => normalizeReviewRow(row, index, options, rawIndex, frontierEvalsIndex, "accepted"));
   const sampleIds = new Set(samples.map((sample) => sample.sampleId));
   const rawResultsPath = path.join(experiment.path, "raw_results.jsonl");
   if (fs.existsSync(rawResultsPath)) {
@@ -86,7 +108,7 @@ export function loadExperiment(name: string, options: LoaderOptions): { experime
         return !!sampleId && !sampleIds.has(sampleId) && (!ok || acceptedCount !== 1);
       });
     const rejectedSamples = rejectedRows.map((row, index) =>
-      normalizeReviewRow(row, samples.length + index, options, rawIndex, "rejected"),
+      normalizeReviewRow(row, samples.length + index, options, rawIndex, frontierEvalsIndex, "rejected"),
     );
     samples.push(...rejectedSamples);
   }
@@ -113,6 +135,7 @@ function normalizeReviewRow(
   index: number,
   options: LoaderOptions,
   rawIndex: Map<string, Record<string, JsonValue>>,
+  frontierEvalsIndex: Map<string, FrontierEvalResult[]>,
   sampleStatus: "accepted" | "rejected",
 ): ReviewSample {
   const normalized = normalizeSourceRow(row, rawIndex, index);
@@ -129,6 +152,7 @@ function normalizeReviewRow(
   const imageUrl = imagePath ? `/api/image?path=${encodeURIComponent(imagePath)}` : null;
   const questions = extractQuestions(normalized);
   const sampleId = asString(normalized.sample_id) || asString(tuple.sample_id) || `${asString(tuple.image_id) || "sample"}::${asString(tuple.ann_id) || index}`;
+  const frontierEvals = frontierEvalsIndex.get(sampleId) || [];
   if (imagePath) {
     try {
       resolveImagePath(imagePath, options);
@@ -161,6 +185,7 @@ function normalizeReviewRow(
       refCentroid: centroidFromBox(refBox),
     },
     questions,
+    frontierEvals,
     usage: asRecord(asRecord(normalized.result)?.usage) || null,
     summary: asRecord(normalized.summary) || null,
     filterStage: asRecord(normalized.filter_stage) || null,
@@ -259,6 +284,42 @@ function primaryDatasetPath(experimentPath: string): string | null {
   }
   return null;
 }
+
+function buildFrontierEvalsIndex(experimentPath: string): Map<string, FrontierEvalResult[]> {
+  const index = new Map<string, FrontierEvalResult[]>();
+  const indexPath = path.join(experimentPath, "frontier_evals_index.jsonl");
+  if (!fs.existsSync(indexPath)) {
+    return index;
+  }
+  const lines = fs
+    .readFileSync(indexPath, "utf8")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  for (const line of lines) {
+    const row = JSON.parse(line) as Record<string, JsonValue>;
+    const sampleId = asString(row.sample_id);
+    if (!sampleId) continue;
+    const rawEvals = Array.isArray(row.evals) ? row.evals : [];
+    const evals: FrontierEvalResult[] = rawEvals.map((e) => {
+      const rec = asRecord(e as JsonValue) || {};
+      return {
+        model: asString(rec.model) || "",
+        provider: asString(rec.provider),
+        prediction: asString(rec.prediction) || "",
+        predictionNorm: asString(rec.prediction_norm) || "",
+        exactCorrect: rec.exact_correct === true,
+        partialCorrect: rec.partial_correct === true,
+        semanticCorrect: rec.semantic_correct === true,
+        softCorrect: rec.soft_correct === true,
+        wordF1: asNumber(rec.word_f1),
+      };
+    });
+    index.set(sampleId, evals);
+  }
+  return index;
+}
+
 
 function buildRawIndex(rawPath: string): Map<string, Record<string, JsonValue>> {
   const index = new Map<string, Record<string, JsonValue>>();

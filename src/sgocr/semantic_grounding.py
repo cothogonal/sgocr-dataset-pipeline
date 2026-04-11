@@ -18,6 +18,7 @@ from transformers import AutoModelForCausalLM, AutoModelForZeroShotObjectDetecti
 
 from .bootstrap import normalize_answer
 from .bootstrap_kd import center_from_box, centroid_from_polygon, determine_relation, distance_point_to_box, overlap_fraction
+from .gemini_batch import GeminiBatchRequest, batch_generate_json, image_part_from_payload
 from .semantic_dev40_tuning import load_semantic_dev40_tuning
 from .secrets import GEMINI, get_secret
 
@@ -48,6 +49,38 @@ STOPWORDS = {
     "this",
     "that",
 }
+
+COLOR_TERMS = (
+    "light blue",
+    "dark blue",
+    "navy blue",
+    "sky blue",
+    "bright red",
+    "dark red",
+    "light green",
+    "dark green",
+    "light gray",
+    "dark gray",
+    "light grey",
+    "dark grey",
+    "black",
+    "white",
+    "gray",
+    "grey",
+    "red",
+    "blue",
+    "green",
+    "yellow",
+    "orange",
+    "purple",
+    "pink",
+    "brown",
+    "tan",
+    "gold",
+    "silver",
+    "beige",
+    "cream",
+)
 
 GENERIC_EXCLUDE = {
     "background",
@@ -202,7 +235,59 @@ SAFE_FALLBACK_TAGS = (
     "sign",
 )
 
+QWEN_LOCAL_DISCOVERY_CATEGORIES = (
+    "label",
+    "sign",
+    "banner",
+    "poster",
+    "document",
+    "chart",
+    "diagram",
+    "book",
+    "book cover",
+    "screen",
+    "phone",
+    "tablet",
+    "bottle",
+    "can",
+    "box",
+    "bag",
+    "shirt",
+    "jersey",
+    "jacket",
+    "window",
+    "door",
+    "awning",
+    "storefront",
+    "table",
+    "counter",
+    "shelf",
+    "vehicle",
+    "car",
+    "bus",
+    "truck",
+    "train",
+    "person",
+)
+
 GENERIC_TEXT_ANCHORS = {"sign", "poster", "label", "screen", "display", "board", "wall", "panel"}
+GENERIC_PRIMARY_ANCHORS = {
+    "sign",
+    "poster",
+    "label",
+    "screen",
+    "display",
+    "board",
+    "wall",
+    "panel",
+    "sign wall",
+    "display wall",
+    "poster wall",
+    "sign panel",
+    "display panel",
+    "poster panel",
+    "ad board",
+}
 
 ANCHOR_CATEGORIES = {
     "text_container": {"sign", "sign wall", "sign panel", "poster", "poster wall", "poster panel", "banner", "billboard", "label", "sticker", "menu", "screen", "monitor", "book", "book cover", "album", "cover", "board", "display wall", "display panel", "ad board", "plaque", "nameplate", "document", "page", "sheet", "chart", "diagram", "flyer", "brochure", "booklet"},
@@ -292,6 +377,7 @@ def sanitize_anchor_label(raw_text: str) -> str | None:
     lowered = re.sub(r"\s+", " ", lowered).strip()
     if not lowered:
         return None
+    color = extract_anchor_color(lowered)
     if lowered in GENERIC_EXCLUDE or lowered in NOISY_EXCLUDE:
         return None
     if "no object detected" in lowered or "object detected" in lowered:
@@ -323,14 +409,30 @@ def sanitize_anchor_label(raw_text: str) -> str | None:
     if any(token in lowered for token in ("brochure", "booklet")):
         return "brochure" if "brochure" in lowered else "booklet"
     if any(token in lowered for token in ("can", "tin")):
-        return "can"
+        return f"{color} can" if color else "can"
     if any(token in lowered for token in ("bottle", "jar", "flask")):
-        return "bottle"
+        return f"{color} bottle" if color else "bottle"
     if lowered.endswith("s") and lowered[:-1] in SAFE_ANCHOR_TERMS:
         lowered = lowered[:-1]
     for term in SAFE_ANCHOR_TERMS:
         if re.search(rf"\b{re.escape(term)}\b", lowered):
-            return term
+            return f"{color} {term}" if color else term
+    return None
+
+
+def is_generic_anchor_label(raw_text: str) -> bool:
+    clean = sanitize_anchor_label(raw_text)
+    return bool(clean and clean in GENERIC_PRIMARY_ANCHORS)
+
+
+def extract_anchor_color(raw_text: str) -> str | None:
+    lowered = re.sub(r"[^a-z0-9\s-]+", " ", str(raw_text or "").lower())
+    lowered = re.sub(r"\s+", " ", lowered).strip()
+    if not lowered:
+        return None
+    for color in sorted(COLOR_TERMS, key=lambda item: (-len(item), item)):
+        if re.search(rf"\b{re.escape(color)}\b", lowered):
+            return color
     return None
 
 
@@ -1021,11 +1123,13 @@ def anchor_local_location_metadata(text_box: list[float], anchor_box: list[float
         return {"phrase": "", "synonyms": [], "clean": False, "mode": "none"}
 
     if mode == "corner":
-        phrase = f"toward the {descriptor} of the {label}"
+        natural_descriptor = descriptor.replace("upper", "top").replace("lower", "bottom")
+        phrase = f"toward the {natural_descriptor} of the {label}"
         synonyms = [
             phrase,
-            f"near the {descriptor} of the {label}",
-            f"on the {descriptor.replace(' ', '-')} of the {label}",
+            f"near the {natural_descriptor} of the {label}",
+            f"on the {natural_descriptor.replace(' ', '-')} of the {label}",
+            f"at the {natural_descriptor} of the {label}",
         ]
     elif mode == "horizontal":
         phrase = f"toward the {descriptor} of the {label}"
@@ -1198,24 +1302,11 @@ class GeminiAnchorRelabeler:
         timeout_s: int = 120,
     ) -> dict[str, Any]:
         payload = _encode_pil_image(image_crop, max_side=self.max_side)
-        prompt = (
-            "You are naming the visible object or surface associated with text in an image crop.\n"
-            "Return a short lowercase label of 1 to 4 words.\n"
-            "Use only visible object/surface language.\n"
-            "Do not use world knowledge, sports terminology, professions, subject-matter interpretations, or editorial descriptions.\n"
-            "Prefer the most literal visible surface or container name over a scene guess.\n"
-            "You may propose a better literal label than the candidate list if the crop clearly shows it.\n"
-            "If a plain noun is too vague, prefer a generic compound like \"sign wall\", \"display wall\", \"sign panel\", \"poster panel\", \"car door\", or \"store window\".\n"
-            "If the crop is a printed sheet, page, poster, flyer, brochure, album sleeve, book cover, chart, or document-like surface, prefer those visible surface labels over generic scene nouns.\n"
-            "If the crop shows structured printed regions, a cover, or a page, prefer labels like \"document\", \"page\", \"poster\", \"book cover\", or \"album cover\" when they are visually warranted.\n"
-            "If the crop is a bottle or can, prefer \"bottle\" or \"can\" over building parts like \"door\" or \"window\".\n"
-            "If the crop is a book or cover, prefer \"book cover\".\n"
-            "Do not mention the text content itself in the label.\n"
-            f'current_label: "{current_label}"\n'
-            f"candidate_labels: {json.dumps(candidate_labels[:8], ensure_ascii=False)}\n"
-            f"example_texts: {json.dumps(example_texts[:6], ensure_ascii=False)}\n"
-            f'relation_to_text: "{relation}"\n'
-            "Respond as JSON with keys `label` and `alternates`.\n"
+        prompt = self._build_prompt(
+            current_label=current_label,
+            candidate_labels=candidate_labels,
+            example_texts=example_texts,
+            relation=relation,
         )
         body = {
             "contents": [
@@ -1234,19 +1325,7 @@ class GeminiAnchorRelabeler:
             "generationConfig": {
                 "temperature": 0.1,
                 "responseMimeType": "application/json",
-                "responseJsonSchema": {
-                    "type": "object",
-                    "properties": {
-                        "label": {"type": "string"},
-                        "alternates": {
-                            "type": "array",
-                            "items": {"type": "string"},
-                            "maxItems": 4,
-                        },
-                    },
-                    "required": ["label", "alternates"],
-                    "additionalProperties": False,
-                },
+                "responseJsonSchema": self._response_schema(),
             },
         }
         response = requests.post(
@@ -1261,6 +1340,254 @@ class GeminiAnchorRelabeler:
         response.raise_for_status()
         payload_json = response.json()
         raw_text = _extract_gemini_response_text(payload_json)
+        normalized = self._normalize_relabel_response(
+            raw_text=raw_text,
+            usage=payload_json.get("usageMetadata", {}),
+            current_label=current_label,
+            candidate_labels=candidate_labels,
+        )
+        if not self._should_retry_generic(normalized, current_label=current_label):
+            return normalized
+        retry_prompt = self._build_prompt(
+            current_label=current_label,
+            candidate_labels=candidate_labels,
+            example_texts=example_texts,
+            relation=relation,
+            anti_generic_retry=True,
+        )
+        retry_body = {
+            "contents": [
+                {
+                    "parts": [
+                        {"text": retry_prompt},
+                        {
+                            "inline_data": {
+                                "mime_type": payload["mime_type"],
+                                "data": payload["data"],
+                            }
+                        },
+                    ]
+                }
+            ],
+            "generationConfig": {
+                "temperature": 0.1,
+                "responseMimeType": "application/json",
+                "responseJsonSchema": self._response_schema(),
+            },
+        }
+        retry_response = requests.post(
+            f"https://generativelanguage.googleapis.com/v1beta/models/{self.model_name}:generateContent",
+            headers={
+                "x-goog-api-key": get_secret(GEMINI),
+                "Content-Type": "application/json",
+            },
+            json=retry_body,
+            timeout=timeout_s,
+        )
+        retry_response.raise_for_status()
+        retry_payload_json = retry_response.json()
+        retry_raw_text = _extract_gemini_response_text(retry_payload_json)
+        retried = self._normalize_relabel_response(
+            raw_text=retry_raw_text,
+            usage=retry_payload_json.get("usageMetadata", {}),
+            current_label=current_label,
+            candidate_labels=candidate_labels,
+        )
+        return retried if not self._should_retry_generic(retried, current_label=current_label) else normalized
+
+    def relabel_many(
+        self,
+        items: list[dict[str, Any]],
+        *,
+        chunk_size: int,
+        poll_interval_s: int,
+        timeout_s: int,
+    ) -> dict[str, dict[str, Any]]:
+        requests_by_key: list[GeminiBatchRequest] = []
+        for item in items:
+            payload = _encode_pil_image(item["image_crop"], max_side=self.max_side)
+            requests_by_key.append(
+                GeminiBatchRequest(
+                    key=str(item["key"]),
+                    contents=[
+                        self._build_prompt(
+                            current_label=str(item["current_label"]),
+                            candidate_labels=list(item["candidate_labels"]),
+                            example_texts=list(item["example_texts"]),
+                            relation=str(item["relation"]),
+                        ),
+                        image_part_from_payload(payload),
+                    ],
+                    generation_config={
+                        "temperature": 0.1,
+                        "response_mime_type": "application/json",
+                        "response_json_schema": self._response_schema(),
+                    },
+                    metadata={"request_kind": "anchor_relabel"},
+                )
+            )
+        results = batch_generate_json(
+            model=self.model_name,
+            requests=requests_by_key,
+            display_name_prefix="sgocr-anchor-relabel",
+            chunk_size=int(chunk_size),
+            poll_interval_s=int(poll_interval_s),
+            timeout_s=int(timeout_s),
+        )
+        normalized: dict[str, dict[str, Any]] = {}
+        retry_items: list[dict[str, Any]] = []
+        for item in items:
+            key = str(item["key"])
+            outcome = results.get(key)
+            if outcome is None or outcome.error:
+                normalized[key] = {
+                    "label": str(item["current_label"]),
+                    "alternates": [str(item["current_label"])],
+                    "usage": {},
+                    "raw_text": f"relabel_failed: {(outcome.error if outcome else 'missing batch response')}",
+                }
+                continue
+            try:
+                normalized[key] = self._normalize_relabel_response(
+                    raw_text=outcome.raw_text,
+                    usage=outcome.usage,
+                    current_label=str(item["current_label"]),
+                    candidate_labels=list(item["candidate_labels"]),
+                )
+                if self._should_retry_generic(normalized[key], current_label=str(item["current_label"])):
+                    retry_items.append(item)
+            except Exception as exc:
+                normalized[key] = {
+                    "label": str(item["current_label"]),
+                    "alternates": [str(item["current_label"])],
+                    "usage": {},
+                    "raw_text": f"relabel_failed: {exc}",
+                }
+        if retry_items:
+            retry_requests: list[GeminiBatchRequest] = []
+            for item in retry_items:
+                payload = _encode_pil_image(item["image_crop"], max_side=self.max_side)
+                retry_requests.append(
+                    GeminiBatchRequest(
+                        key=str(item["key"]),
+                        contents=[
+                            self._build_prompt(
+                                current_label=str(item["current_label"]),
+                                candidate_labels=list(item["candidate_labels"]),
+                                example_texts=list(item["example_texts"]),
+                                relation=str(item["relation"]),
+                                anti_generic_retry=True,
+                            ),
+                            image_part_from_payload(payload),
+                        ],
+                        generation_config={
+                            "temperature": 0.1,
+                            "response_mime_type": "application/json",
+                            "response_json_schema": self._response_schema(),
+                        },
+                        metadata={"request_kind": "anchor_relabel_retry"},
+                    )
+                )
+            retry_results = batch_generate_json(
+                model=self.model_name,
+                requests=retry_requests,
+                display_name_prefix="sgocr-anchor-relabel-retry",
+                chunk_size=int(chunk_size),
+                poll_interval_s=int(poll_interval_s),
+                timeout_s=int(timeout_s),
+            )
+            for item in retry_items:
+                key = str(item["key"])
+                outcome = retry_results.get(key)
+                if outcome is None or outcome.error:
+                    continue
+                try:
+                    retried = self._normalize_relabel_response(
+                        raw_text=outcome.raw_text,
+                        usage=outcome.usage,
+                        current_label=str(item["current_label"]),
+                        candidate_labels=list(item["candidate_labels"]),
+                    )
+                    if not self._should_retry_generic(retried, current_label=str(item["current_label"])):
+                        normalized[key] = retried
+                except Exception:
+                    continue
+        return normalized
+
+    def _build_prompt(
+        self,
+        *,
+        current_label: str,
+        candidate_labels: list[str],
+        example_texts: list[str],
+        relation: str,
+        anti_generic_retry: bool = False,
+    ) -> str:
+        tuning = load_semantic_dev40_tuning()
+        anti_generic = tuning.anchor_relabel_generic_mode == "anti_generic" or anti_generic_retry
+        lines = [
+            "You are naming the best visible referring expression for the object, object-part, or surface that the text belongs to in an image crop.",
+            "Return a short lowercase label of 1 to 5 words.",
+            "Use only visible object language.",
+            "Include a visible color adjective when it is clear and stable, for example `red can`, `blue jersey`, `white airplane tail`, or `silver car door`.",
+            "Prefer a specific visible object class over a generic support surface.",
+            "If the text belongs to a visible object part, prefer the part name, such as `car door`, `airplane tail`, `helmet`, `bus side`, `storefront window`, or `jersey chest`.",
+            "Do not use world knowledge, sports terminology, professions, subject-matter interpretations, or editorial descriptions.",
+            "Do not mention the text content itself in the label.",
+            "You may propose a better literal label than the candidate list if the crop clearly shows it.",
+        ]
+        if anti_generic:
+            lines.extend(
+                [
+                    "Avoid generic labels such as `sign`, `wall`, `board`, `panel`, `display`, `surface`, `object`, `area`, `sign wall`, or `display panel` unless there is truly no more specific visible object.",
+                    "If a person, vehicle, clothing item, container, storefront element, device, or object part is visible, name that instead of a generic text surface.",
+                    "Good labels: `red airplane tail`, `blue baseball helmet`, `white bus side`, `silver car door`, `green bottle`, `black jersey chest`.",
+                ]
+            )
+        else:
+            lines.extend(
+                [
+                    "If the crop is a printed sheet, page, poster, flyer, brochure, book cover, chart, or document-like surface, prefer those visible surface labels over generic scene nouns.",
+                    "If the crop is a bottle or can, prefer `bottle` or `can` over building parts like `door` or `window`.",
+                    "If the crop is a book or cover, prefer `book cover`.",
+                ]
+            )
+        if anti_generic_retry:
+            lines.append("Your previous answer was too generic. Retry with a more specific visible object or object-part label.")
+        lines.extend(
+            [
+                f'current_label: "{current_label}"',
+                f"candidate_labels: {json.dumps(candidate_labels[:8], ensure_ascii=False)}",
+                f"example_texts: {json.dumps(example_texts[:6], ensure_ascii=False)}",
+                f'relation_to_text: "{relation}"',
+                "Respond as JSON with keys `label` and `alternates`.",
+            ]
+        )
+        return "\n".join(lines) + "\n"
+
+    def _response_schema(self) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "label": {"type": "string"},
+                "alternates": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "maxItems": 4,
+                },
+            },
+            "required": ["label", "alternates"],
+            "additionalProperties": False,
+        }
+
+    def _normalize_relabel_response(
+        self,
+        *,
+        raw_text: str,
+        usage: dict[str, Any],
+        current_label: str,
+        candidate_labels: list[str],
+    ) -> dict[str, Any]:
         parsed = json.loads(raw_text)
         label = sanitize_anchor_label(str(parsed.get("label") or ""))
         alternates = []
@@ -1274,9 +1601,18 @@ class GeminiAnchorRelabeler:
         return {
             "label": label or sanitize_anchor_label(current_label) or current_label,
             "alternates": alternates,
-            "usage": payload_json.get("usageMetadata", {}),
+            "usage": usage,
             "raw_text": raw_text,
         }
+
+    def _should_retry_generic(self, normalized: dict[str, Any], *, current_label: str) -> bool:
+        tuning = load_semantic_dev40_tuning()
+        if tuning.anchor_relabel_generic_mode != "anti_generic":
+            return False
+        label = str(normalized.get("label") or "")
+        if not is_generic_anchor_label(label):
+            return False
+        return True
 
 
 class GroundingDinoGrounder:
