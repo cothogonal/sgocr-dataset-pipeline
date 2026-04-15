@@ -68,36 +68,35 @@ PYTHONPATH=sgocr/src python -m sgocr.scripts.mixed_ita13_sweep \
 
 ## Pipeline Overview
 
+The following describes the `ita13_propbonus_offset20` (v0) build.
+
 ```
-Stage A — Text Detection
-  PaddleOCR PP-OCRv5_server_det
-  → raw bounding boxes
+Stage A — OCR
+  Nemotron OCR v2  (NVIDIA)
+  → text bounding boxes + confidence scores → text_nodes.jsonl
 
-Stage B — OCR Ensemble + Consensus
-  Nemotron OCR v2  (primary, NVIDIA)
-  PArSeq            (scene-text specialist)
-  TrOCR small + base (transformer OCR)
-  → confidence-weighted consensus → text_nodes.jsonl
+Stage B — Anchor Tag Discovery
+  Florence-2-large  (region captioning, seeded with image context)
+  → candidate anchor label vocabulary per image
 
-Stage C — Anchor Discovery + Grounding
-  Qwen3-VL via vLLM  (multi-pass visual inventory of anchor regions)
-  Florence-2-large   (region caption tagging)
-  GroundingDINO-base (groundback IoU verification — rejects hallucinated anchors)
+Stage C — Anchor Candidate Generation + Groundback
+  Qwen3-VL-8B-Instruct-FP8  (vLLM, multi-pass visual inventory)
+  GroundingDINO-base         (groundback: re-localises each anchor label,
+                              rejects candidates with IoU < 0.40)
   → grounded_anchors.jsonl
 
 Stage D — Tuple Construction + Geometric Filtering
-  centroid offset gate  (spatial min-offset to avoid trivially locatable text)
-  IoU deduplication     (suppress overlapping candidates)
-  type-constrained selection  (target N QAs/image, per-type hard caps + score bonuses)
+  centroid offset gate   (min spatial offset filters text trivially locatable by position alone)
+  type-constrained selection  (target=5 QAs/image, RG hard cap=2, TP/AP selection bonus=0.5,
+                               RG oversample boost=1.5)
+  RG leakage check       (strips color/shape tokens from REVERSE_GROUND anchor labels, re-probes)
   → selected_tuples.jsonl
 
 Stage E — Teacher QA Generation
-  Gemini 2.5 Flash  (generates question + answer from (image, anchor, text) tuple)
+  Gemini 2.5 Flash  (question + answer from (image, anchor, text_node) tuple)
   → raw_qa.jsonl
 
-Stage F — Verification + Packaging
-  RG leakage check     (strips color/shape tokens from REVERSE_GROUND anchors, re-probes)
-  groundback re-verify (final GroundingDINO pass on accepted tuples)
+Stage F — Packaging
   → ocr_qa_dataset.jsonl
 ```
 
@@ -113,10 +112,10 @@ Stage F — Verification + Packaging
 
 **Evaluation:**
 
-Two eval passes run automatically at the end of each sweep:
+Two passes run at the end of each sweep to measure dataset quality:
 
-- **Inline frontier scoring** — Gemini 2.5 Flash scores every accepted QA in context (image + question → predicted answer, soft-matched against gold). Produces a per-run `sweep_score` used to compare variants.
-- **Image-dependence eval** — Gemini 3 Flash Preview answers each QA twice: once with the image, once text-only. Vision-necessary rate (image correct, text wrong) and text-leaky rate (text-only correct) are the primary quality signals. A healthy dataset targets high vision-nec% and low text-leaky%.
+- **Inline frontier scoring** — Gemini 2.5 Flash answers every accepted QA with the image in context. Soft-match against gold answer produces a per-run `sweep_score` for variant comparison.
+- **Image-dependence eval** — Gemini 3 Flash Preview answers each QA twice: once with image+question, once with text-only. The gap between the two measures how much the image is actually required. *Vision-necessary rate* (image correct, text-only wrong) and *text-leaky rate* (text-only correct) are the primary output quality signals.
 
 ---
 
