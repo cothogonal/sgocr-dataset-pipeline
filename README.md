@@ -93,6 +93,73 @@ Question types:
 
 ---
 
+## Sample Row
+
+Source image: `chartqa_train` — a bar chart with a scrollable year-selector panel on the right edge.
+
+```json
+{
+  "sample_id": "chartqa:shared:0f35d...TEXT_PROPERTY__TEXT_CURVATURE",
+  "image_id": "chartqa:shared:0f35d793f45924aa03d6984acecf701cd5d4468773e148ef453f8c33beecb656",
+  "image_path": "data/vm_ssl/raw/chartqa/images/0f/0f35d793...png",
+  "image_width": 800,
+  "image_height": 557,
+
+  "question": "What is the shape of the text '2021' on the button, the lower-right text near the lower-right area of the image?",
+  "answer": "straight",
+  "question_type": "TEXT_PROPERTY",
+
+  "anchor_label": "button",
+  "anchor_box": [717.6, 476.79, 791.2, 518.01],
+  "text_bbox": [728.22, 491.46, 25.14, 9.76],
+  "ocr_confidence": 0.9399,
+
+  "tags": {
+    "question_type": "TEXT_PROPERTY",
+    "answer_type": "attribute",
+    "text_property_type": "text_curvature",
+    "answer_source": "teacher_visual",
+    "difficulty": "hard",
+    "quality_tier": "tier_a",
+    "ambiguity_level": "high",
+    "text_case": "numeric",
+    "anchor_category": "other",
+    "has_reference_object": false
+  },
+
+  "grounding": {
+    "anchor_label": "button",
+    "anchor_box": [717.6, 476.79, 791.2, 518.01],
+    "anchor_score": 0.42,
+    "anchor_region_phrase": "lower-right area of the image",
+    "relation": "on",
+    "query_text_reference": "2021",
+    "specific_location_phrase": "lower-right text in the lower-right area of the image"
+  },
+
+  "kd_metadata": {
+    "text_density": 59,
+    "local_text_cluster_shape": "grid",
+    "local_text_cluster_resolvable": 56,
+    "layout_detail": "59 nearby text boxes form a grid; target is the lower-right text; 56 resolvable and 3 unresolved"
+  },
+
+  "inline_frontier": {
+    "model": "gemini-3-flash-preview",
+    "correct": true,
+    "score": {
+      "prediction_norm": "straight",
+      "gold_norm": "straight",
+      "soft_correct": true
+    }
+  }
+}
+```
+
+The pipeline grounds every QA to a visible text element (`text_bbox`), an anchor object (`anchor_label` + `anchor_box`), and a spatial region phrase — so each row carries enough structure to reconstruct or audit the question without re-running the model.
+
+---
+
 ## Key Tuning Parameters
 
 | Env var | Default | Effect |
