@@ -95,13 +95,13 @@ Question types:
 
 ## Sample Rows
 
-**DIRECT_READ** (`chartqa_train` — bar chart with year-selector panel):
-> *"What text is on the panel, specifically the lower-right text within the lower-right area of the image?"*
-> **2021**
+**DIRECT_READ** — *"What text is on the panel, specifically the lower-right text within the lower-right area of the image?"* → **2021**
 
-**REVERSE_GROUND** (`chartqa_train` — same image family):
-> *"Where does the text 'Information' appear?"*
-> **on the button**
+![DIRECT_READ sample](assets/sample_direct_read.png)
+
+**REVERSE_GROUND** — *"Where does the text 'Information' appear?"* → **on the button**
+
+![REVERSE_GROUND sample](assets/sample_reverse_ground.png)
 
 Both rows share the same schema:
 
