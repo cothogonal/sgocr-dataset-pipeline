@@ -138,6 +138,33 @@ FALLBACK_TAGS = (
 )
 
 SAFE_ANCHOR_TERMS = (
+    "airplane tail",
+    "plane tail",
+    "vehicle side",
+    "bus side",
+    "car side",
+    "car hood",
+    "car bumper",
+    "car windshield",
+    "license plate",
+    "baseball helmet",
+    "helmet",
+    "head",
+    "face",
+    "jersey chest",
+    "shirt chest",
+    "shirt sleeve",
+    "jersey sleeve",
+    "sleeve",
+    "collar",
+    "tail",
+    "wing",
+    "tube",
+    "frame",
+    "bottle label",
+    "can label",
+    "box side",
+    "panel",
     "sign wall",
     "display wall",
     "poster wall",
@@ -235,6 +262,51 @@ SAFE_FALLBACK_TAGS = (
     "sign",
 )
 
+OPEN_COLOR_OBJECT_TERMS = (
+    "helmet",
+    "head",
+    "face",
+    "shirt",
+    "jersey",
+    "jacket",
+    "sleeve",
+    "collar",
+    "chest",
+    "bottle",
+    "can",
+    "box",
+    "bag",
+    "phone",
+    "tablet",
+    "screen",
+    "monitor",
+    "sign",
+    "poster",
+    "banner",
+    "label",
+    "document",
+    "book",
+    "page",
+    "window",
+    "door",
+    "awning",
+    "storefront",
+    "table",
+    "counter",
+    "shelf",
+    "vehicle",
+    "car",
+    "truck",
+    "bus",
+    "train",
+    "airplane",
+    "tail",
+    "wing",
+    "hood",
+    "bumper",
+    "windshield",
+)
+
 QWEN_LOCAL_DISCOVERY_CATEGORIES = (
     "label",
     "sign",
@@ -268,6 +340,63 @@ QWEN_LOCAL_DISCOVERY_CATEGORIES = (
     "truck",
     "train",
     "person",
+)
+
+QWEN_GLOBAL_INVENTORY_CATEGORIES = (
+    "person",
+    "face",
+    "head",
+    "helmet",
+    "hat",
+    "shirt",
+    "jersey",
+    "jacket",
+    "bag",
+    "backpack",
+    "bottle",
+    "can",
+    "cup",
+    "box",
+    "package",
+    "book",
+    "page",
+    "document",
+    "label",
+    "sticker",
+    "sign",
+    "poster",
+    "banner",
+    "menu",
+    "screen",
+    "monitor",
+    "phone",
+    "tablet",
+    "chart",
+    "diagram",
+    "board",
+    "whiteboard",
+    "chalkboard",
+    "window",
+    "door",
+    "wall",
+    "building",
+    "storefront",
+    "table",
+    "counter",
+    "shelf",
+    "vehicle",
+    "car",
+    "truck",
+    "bus",
+    "train",
+    "airplane",
+    "boat",
+)
+
+QWEN_INDEPENDENT_RAW_INVENTORY_CATEGORY_TEXT = (
+    "all visible objects, object parts, surfaces, landmarks, and scene elements that could be useful as anchors for referring to text later, "
+    "even if they do not themselves contain text; prefer specific visible object or object-part labels; include a visible color adjective when it is clear and stable; "
+    "use 'with' to connect multiple descriptive attributes (e.g. 'man with dark hoodie' not 'man dark hoodie')"
 )
 
 GENERIC_TEXT_ANCHORS = {"sign", "poster", "label", "screen", "display", "board", "wall", "panel"}
@@ -412,6 +541,17 @@ def sanitize_anchor_label(raw_text: str) -> str | None:
         return f"{color} can" if color else "can"
     if any(token in lowered for token in ("bottle", "jar", "flask")):
         return f"{color} bottle" if color else "bottle"
+    if color:
+        tokens = lowered.split()
+        filtered = [token for token in tokens if token not in {"the", "a", "an", "of", "on", "near", "part", "side"}]
+        for width in (3, 2, 1):
+            if len(filtered) >= width:
+                phrase = " ".join(filtered[-width:])
+                if phrase in SAFE_ANCHOR_TERMS:
+                    return f"{color} {phrase}" if not phrase.startswith(color) else phrase
+        for term in OPEN_COLOR_OBJECT_TERMS:
+            if re.search(rf"\b{re.escape(term)}\b", lowered):
+                return f"{color} {term}"
     if lowered.endswith("s") and lowered[:-1] in SAFE_ANCHOR_TERMS:
         lowered = lowered[:-1]
     for term in SAFE_ANCHOR_TERMS:
@@ -451,6 +591,47 @@ def sanitize_anchor_tags(*raw_sources: str, max_tags: int = 6) -> list[str]:
             if len(out) >= max_tags:
                 return out
     return out
+
+
+def normalize_independent_anchor_label(raw_text: str) -> str | None:
+    lowered = re.sub(r"[^a-z0-9\\s-]+", " ", str(raw_text or "").lower())
+    lowered = re.sub(r"\\s+", " ", lowered).strip()
+    if not lowered:
+        return None
+    if any(
+        phrase in lowered
+        for phrase in (
+            "bbox",
+            "coordinates",
+            "json format",
+            "category",
+            "categories",
+            "useful as anchors",
+            "referring to text",
+            "object parts surfaces",
+            "report bbox",
+            "locate every instance",
+        )
+    ):
+        return None
+    cleaned = sanitize_anchor_label(lowered)
+    if cleaned:
+        return cleaned
+    tokens = [token for token in lowered.split() if token not in STOPWORDS]
+    while tokens and tokens[0] in {"visible", "specific", "clear", "stable", "useful", "possible"}:
+        tokens.pop(0)
+    while tokens and tokens[-1] in {"visible", "specific", "clear", "stable", "useful", "possible"}:
+        tokens.pop()
+    if not tokens:
+        return None
+    phrase = " ".join(tokens[:5]).strip()
+    if not phrase or phrase in GENERIC_EXCLUDE or phrase in NOISY_EXCLUDE:
+        return None
+    if phrase.endswith("s") and len(tokens) == 1 and len(phrase) >= 5 and phrase[:-1] not in GENERIC_EXCLUDE:
+        phrase = phrase[:-1]
+    if phrase in GENERIC_EXCLUDE or phrase in NOISY_EXCLUDE:
+        return None
+    return phrase
 
 
 def _connected_text_component(

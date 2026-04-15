@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import statistics
+import time
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
@@ -27,9 +29,15 @@ from .dev40_complete import (
 from .ocr_runtime import CraftDetector, PARSeqRecognizer, PaddleOCRDetector, PaddleOCRRecognizer, TrOCRRecognizer, bbox_to_polygon, crop_with_padding
 from .nemotron_frontend import run_nemotron_ocr_stage
 from .qwen_anchor_vllm import (
+    INDEPENDENT_QWEN_INVENTORY_PROMPT,
+    INDEPENDENT_QWEN_INVENTORY_PROMPT_ANTI_OCR,
     OPEN_QWEN_LOCAL_DISCOVERY_PROMPT,
+    OPEN_QWEN_LOCAL_DISCOVERY_PROMPT_COLOR_SPECIFIC,
     QwenAnchorGrounderVLLM,
     QwenAnchorRequest,
+    is_degenerate_anchor_label,
+    is_ocr_text_label,
+    merge_qwen_inventory_passes,
     normalize_qwen_description,
 )
 from .semantic_dev40_tuning import load_semantic_dev40_tuning
@@ -38,6 +46,7 @@ from .semantic_grounding import (
     FALLBACK_TAGS,
     GeminiAnchorRelabeler,
     GroundingDinoGrounder,
+    QWEN_GLOBAL_INVENTORY_CATEGORIES,
     QWEN_LOCAL_DISCOVERY_CATEGORIES,
     Sam3Refiner,
     SAFE_FALLBACK_TAGS,
@@ -49,8 +58,10 @@ from .semantic_grounding import (
     categorize_anchor,
     consolidate_anchor_candidates,
     collect_semantic_kd_metadata,
+    extract_anchor_color,
     expand_grounding_tags_for_node,
     expand_box,
+    normalize_independent_anchor_label,
     remap_region_box_to_image,
     sanitize_anchor_label,
     sanitize_anchor_tags,
@@ -65,11 +76,71 @@ RUNTIME_MODELS = {
     "ocr_frontend": "classic",
     "anchor_tag_discovery_backend": "florence",
     "anchor_candidate_backend": "florence_dino",
+    "qwen_anchor_inventory_mode": "selected_tags",
+    "qwen_anchor_inventory_pass_count": 1,
+    "qwen_anchor_inventory_temperature": 0.0,
+    "qwen_anchor_inventory_consensus_iou": 0.55,
+    "qwen_anchor_inventory_min_support": 1,
     "detector": "PP-OCRv5_server_det",
     "recognizers": ["parseq", "PP-OCRv5_server_rec", "microsoft/trocr-large-printed"],
     "semantic_tagger": "microsoft/Florence-2-large",
     "grounder": "IDEA-Research/grounding-dino-base",
 }
+
+
+class _StageProgressLogger:
+    def __init__(self, stage_name: str, total: int) -> None:
+        self.stage_name = str(stage_name)
+        self.total = max(0, int(total))
+        self._start = time.time()
+        self._last_fraction = -1
+        self._path = Path(os.environ["SGOCR_PROGRESS_LOG_PATH"]).expanduser() if os.environ.get("SGOCR_PROGRESS_LOG_PATH") else None
+
+    def _emit(self, message: str) -> None:
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%S")
+        line = f"[{stamp}] [stage:{self.stage_name}] {message}"
+        print(line, flush=True)
+        if self._path is not None:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            with self._path.open("a", encoding="utf-8") as f:
+                f.write(line + "\n")
+
+    def start(self) -> None:
+        if self.total > 0:
+            self._emit(f"start total={self.total}")
+        else:
+            self._emit("start total=0")
+
+    def tick(self, completed: int, *, extra: str = "") -> None:
+        completed = max(0, int(completed))
+        if self.total <= 0:
+            return
+        fraction = min(100, int((completed * 100) / self.total))
+        if completed < self.total and fraction <= self._last_fraction:
+            return
+        if completed < self.total and fraction < 1:
+            return
+        self._last_fraction = fraction
+        elapsed = max(time.time() - self._start, 1e-6)
+        rate = completed / elapsed if completed > 0 else 0.0
+        suffix = f" {extra}" if extra else ""
+        self._emit(
+            f"progress completed={completed}/{self.total} pct={fraction}% elapsed_s={elapsed:.1f} rate_per_s={rate:.2f}{suffix}"
+        )
+
+    def finish(self, *, extra: str = "") -> None:
+        elapsed = max(time.time() - self._start, 1e-6)
+        suffix = f" {extra}" if extra else ""
+        if self.total > 0:
+            self._emit(f"finish completed={self.total}/{self.total} pct=100% elapsed_s={elapsed:.1f}{suffix}")
+        else:
+            self._emit(f"finish elapsed_s={elapsed:.1f}{suffix}")
+
+
+def _make_stage_progress_logger(stage_name: str, total: int) -> _StageProgressLogger:
+    logger = _StageProgressLogger(stage_name, total)
+    logger.start()
+    return logger
 
 
 def _ocr_runtime_signature(runtime_models: dict[str, Any]) -> dict[str, Any]:
@@ -86,6 +157,11 @@ def _semantic_runtime_signature(runtime_models: dict[str, Any]) -> dict[str, Any
         "grounder": runtime_models.get("grounder"),
         "anchor_tag_discovery_backend": runtime_models.get("anchor_tag_discovery_backend", "florence"),
         "anchor_candidate_backend": runtime_models.get("anchor_candidate_backend", "florence_dino"),
+        "qwen_anchor_inventory_mode": runtime_models.get("qwen_anchor_inventory_mode", "selected_tags"),
+        "qwen_anchor_inventory_pass_count": runtime_models.get("qwen_anchor_inventory_pass_count", 1),
+        "qwen_anchor_inventory_temperature": runtime_models.get("qwen_anchor_inventory_temperature", 0.0),
+        "qwen_anchor_inventory_consensus_iou": runtime_models.get("qwen_anchor_inventory_consensus_iou", 0.55),
+        "qwen_anchor_inventory_min_support": runtime_models.get("qwen_anchor_inventory_min_support", 1),
     }
 
 
@@ -635,6 +711,7 @@ def build_merged_sign_tuples_for_image(
                     "anchor_local_mode": str(anchor_local["mode"]),
                     "anchor_box": [round(float(v), 2) for v in anchor["box"]],
                     "anchor_score": float(anchor["score"]),
+                    "anchor_color": str(extract_anchor_color(str(anchor["label"])) or ""),
                     "anchor_category": categorize_anchor(str(anchor["label"])),
                     "anchor_source": str(anchor.get("source") or "grounding_dino"),
                     "relation": "on",
@@ -739,11 +816,17 @@ def build_dev40_semantic_dataset(
     max_tags_per_image: int = 8,
     cache_level: str = "verified",
 ) -> dict[str, Any]:
+    pipeline_start = time.time()
     tuning = load_semantic_dev40_tuning()
     runtime_models = dict(RUNTIME_MODELS)
     runtime_models["ocr_frontend"] = tuning.ocr_frontend
     runtime_models["anchor_tag_discovery_backend"] = tuning.anchor_tag_discovery_backend
     runtime_models["anchor_candidate_backend"] = tuning.anchor_candidate_backend
+    runtime_models["qwen_anchor_inventory_mode"] = tuning.qwen_anchor_inventory_mode
+    runtime_models["qwen_anchor_inventory_pass_count"] = tuning.qwen_anchor_inventory_pass_count
+    runtime_models["qwen_anchor_inventory_temperature"] = tuning.qwen_anchor_inventory_temperature
+    runtime_models["qwen_anchor_inventory_consensus_iou"] = tuning.qwen_anchor_inventory_consensus_iou
+    runtime_models["qwen_anchor_inventory_min_support"] = tuning.qwen_anchor_inventory_min_support
     if tuning.anchor_candidate_backend == "qwen3_vl_vllm" or tuning.anchor_tag_discovery_backend == "qwen3_vl_vllm":
         runtime_models["grounder"] = tuning.qwen_anchor_model
     if tuning.sam3_refine_mode != "none":
@@ -763,14 +846,14 @@ def build_dev40_semantic_dataset(
         try:
             cached_runtime_models = json.loads((cache_intermediate_dir / "runtime_models.json").read_text(encoding="utf-8"))
             if cache_level == "ocr":
-                cache_compatible = _ocr_runtime_signature(cached_runtime_models) == _ocr_runtime_signature(RUNTIME_MODELS)
+                cache_compatible = _ocr_runtime_signature(cached_runtime_models) == _ocr_runtime_signature(runtime_models)
             elif cache_level == "verified":
                 cache_compatible = (
-                    _ocr_runtime_signature(cached_runtime_models) == _ocr_runtime_signature(RUNTIME_MODELS)
-                    and _semantic_runtime_signature(cached_runtime_models) == _semantic_runtime_signature(RUNTIME_MODELS)
+                    _ocr_runtime_signature(cached_runtime_models) == _ocr_runtime_signature(runtime_models)
+                    and _semantic_runtime_signature(cached_runtime_models) == _semantic_runtime_signature(runtime_models)
                 )
             else:
-                cache_compatible = cached_runtime_models == RUNTIME_MODELS
+                cache_compatible = cached_runtime_models == runtime_models
         except Exception:
             cache_compatible = False
 
@@ -778,6 +861,10 @@ def build_dev40_semantic_dataset(
         raise ValueError(f"Unsupported cache_level: {cache_level}")
 
     if cache_compatible and cache_intermediate_dir and cache_level != "none" and (cache_intermediate_dir / "text_nodes.jsonl").exists():
+        print(
+            f"[stage:pipeline] cache_reuse cache_level={cache_level} cache_dir={cache_intermediate_dir}",
+            flush=True,
+        )
         text_nodes = load_jsonl(cache_intermediate_dir / "text_nodes.jsonl")
         consensus_stats = json.loads((cache_intermediate_dir / "consensus_stats.json").read_text(encoding="utf-8"))
         detection_rows = load_jsonl(cache_intermediate_dir / "text_detections.jsonl") if (cache_intermediate_dir / "text_detections.jsonl").exists() else []
@@ -830,6 +917,7 @@ def build_dev40_semantic_dataset(
                 }
     else:
         if tuning.ocr_frontend == "nemotron_v2":
+            print(f"[stage:pipeline] start nemotron_ocr images={len(image_specs)}", flush=True)
             detections_by_image, detection_rows, detection_summary, text_nodes, consensus_stats = run_nemotron_ocr_stage(
                 image_specs=image_specs,
                 image_source_map=image_source_map,
@@ -839,6 +927,7 @@ def build_dev40_semantic_dataset(
             write_jsonl(intermediate_dir / "text_nodes.jsonl", text_nodes)
             write_json(intermediate_dir / "consensus_stats.json", consensus_stats)
         else:
+            print(f"[stage:pipeline] start classic_ocr images={len(image_specs)}", flush=True)
             detections_by_image, detection_rows, detection_summary = run_detection_stage(
                 image_specs=image_specs,
                 device=runtime_device,
@@ -888,6 +977,10 @@ def build_dev40_semantic_dataset(
     write_jsonl(intermediate_dir / "text_nodes.jsonl", text_nodes)
 
     resolvable_nodes = [node for node in text_nodes if node["resolvable"]]
+    print(
+        f"[stage:pipeline] resolvability text_nodes={len(text_nodes)} resolvable_nodes={len(resolvable_nodes)} elapsed_s={time.time() - pipeline_start:.1f}",
+        flush=True,
+    )
     resolvability_stats = build_resolvability_stats(text_nodes)
     write_jsonl(intermediate_dir / "text_nodes_resolvable.jsonl", resolvable_nodes)
     write_json(intermediate_dir / "resolvability_stats.json", resolvability_stats)
@@ -903,6 +996,10 @@ def build_dev40_semantic_dataset(
             if row.get("top_candidates")
         }
     else:
+        print(
+            f"[stage:pipeline] start anchor_stage resolvable_nodes={len(resolvable_nodes)}",
+            flush=True,
+        )
         anchor_tag_rows, grounded_anchor_rows, best_anchor_by_node = run_anchor_stage(
             image_specs=image_specs,
             resolvable_nodes=resolvable_nodes,
@@ -914,6 +1011,10 @@ def build_dev40_semantic_dataset(
         write_jsonl(intermediate_dir / "grounded_anchors.jsonl", grounded_anchor_rows)
         if runtime_device.startswith("cuda") and torch.cuda.is_available():
             torch.cuda.empty_cache()
+        print(
+            f"[stage:pipeline] start verified_tuple_build grounded_anchor_rows={len(grounded_anchor_rows)}",
+            flush=True,
+        )
         verified_tuples, tuple_debug = build_verified_tuples(
             image_specs=image_specs,
             all_text_nodes=text_nodes,
@@ -924,6 +1025,10 @@ def build_dev40_semantic_dataset(
         )
     relabel_model = _anchor_relabel_model_name(tuning.anchor_relabel_mode)
     if relabel_model:
+        print(
+            f"[stage:pipeline] start anchor_relabel verified_tuples={len(verified_tuples)} model={relabel_model}",
+            flush=True,
+        )
         verified_tuples = refine_anchor_labels(verified_tuples, model_name=relabel_model)
     write_jsonl(intermediate_dir / "verified_tuples.jsonl", verified_tuples)
 
@@ -954,10 +1059,18 @@ def build_dev40_semantic_dataset(
                 "selected_candidates": [{**candidate, "candidate_index": idx} for idx, candidate in enumerate(selected, start=1)],
             }
         )
+    print(
+        f"[stage:pipeline] candidate_selection verified_tuples={len(verified_tuples)} candidate_tuples={len(candidate_rows)} selected_tuples={len(selected_rows)} elapsed_s={time.time() - pipeline_start:.1f}",
+        flush=True,
+    )
 
     write_jsonl(intermediate_dir / "candidate_tuples.jsonl", candidate_rows)
     write_jsonl(intermediate_dir / "selected_tuples.jsonl", selected_rows)
 
+    print(
+        f"[stage:pipeline] start teacher_generation image_batches={len(image_batches)} selected_tuples={len(selected_rows)}",
+        flush=True,
+    )
     teacher_results = run_teacher_batches(
         image_batches=image_batches,
         model=model,
@@ -981,6 +1094,137 @@ def build_dev40_semantic_dataset(
         model=str(load_semantic_dev40_tuning().inline_frontier_model),
         max_side=max_side,
         workers=workers,
+    )
+
+    # --- Inline frontier gate ---
+    # Reject rows where the frontier model (shown the image) got the answer wrong.
+    # This is a verification gate using already-computed data — no extra API cost.
+    # "Tiny natural error": some genuinely hard questions may fail; accepted here as inherent noise.
+    #
+    # Error-passthrough: if the frontier eval API call failed (e.g. rate-limited 429), the row is
+    # treated as "pass" — only rows with a valid model judgment of "wrong" are rejected.
+    # Without this, rate limiting causes 100% rejection (all errors → correct=False → all rejected).
+    if tuning.inline_frontier_gate_enabled and final_rows:
+        pre_gate = len(final_rows)
+        wf1_floor = float(tuning.inline_frontier_gate_word_f1_floor)
+
+        # Determine which question types the gate applies to.
+        # "all" (default) applies the gate to every row; a comma-separated list restricts it.
+        _gate_types_raw = str(tuning.inline_frontier_gate_question_types or "all").strip()
+        if _gate_types_raw.lower() == "all":
+            _gate_question_types: frozenset[str] | None = None
+        else:
+            _gate_question_types = frozenset(t.strip().upper() for t in _gate_types_raw.split(",") if t.strip())
+
+        def _frontier_eval_errored(row: dict) -> bool:
+            return bool((row.get("inline_frontier") or {}).get("error"))
+
+        def _gated(row: dict) -> bool:
+            """True if this row's question type is subject to the frontier gate."""
+            if _gate_question_types is None:
+                return True
+            return str(row.get("question_type") or "").upper() in _gate_question_types
+
+        if wf1_floor < 0.0:
+            # Standard binary gate: keep rows the frontier model answered correctly, or where eval
+            # errored, or where the question type is excluded from the gate.
+            final_rows = [
+                row for row in final_rows
+                if not _gated(row) or row.get("inline_frontier_correct") is True or _frontier_eval_errored(row)
+            ]
+        else:
+            # Lenient gate: also accept rows where word-F1 meets the floor, or where eval errored.
+            # word_f1 is non-zero only for REVERSE_GROUND; all other types use soft_correct.
+            def _passes_lenient_gate(row: dict) -> bool:
+                if not _gated(row):
+                    return True
+                if row.get("inline_frontier_correct") is True or _frontier_eval_errored(row):
+                    return True
+                word_f1 = float(
+                    (row.get("inline_frontier") or {}).get("score", {}).get("word_f1") or 0.0
+                )
+                return word_f1 >= wf1_floor
+
+            final_rows = [row for row in final_rows if _passes_lenient_gate(row)]
+
+        frontier_gate_errored = sum(1 for row in final_rows if _gated(row) and _frontier_eval_errored(row))
+        frontier_gate_rejected = pre_gate - len(final_rows)
+        frontier_gate_type_skipped = sum(1 for row in final_rows if not _gated(row))
+        failure_counts["inline_frontier_gate_rejected"] = frontier_gate_rejected
+        print(
+            f"[inline_frontier_gate] pre={pre_gate} accepted={len(final_rows)} rejected={frontier_gate_rejected}"
+            f" errored_passthrough={frontier_gate_errored} type_skipped={frontier_gate_type_skipped}"
+            f" wf1_floor={wf1_floor:.2f}",
+            flush=True,
+        )
+
+    # --- Vision dependence gate ---
+    # Run text-only eval on each row; reject rows where the answer is derivable without the image.
+    # One extra Gemini Flash call per row — the empirical verification that vision is actually required.
+    if tuning.vision_dependence_gate_enabled and final_rows:
+        from .dev200_eval import apply_vision_dependence_gate
+        pre_gate = len(final_rows)
+        final_rows, vdep_stats = apply_vision_dependence_gate(
+            final_rows,
+            model=str(tuning.inline_frontier_model),
+            workers=workers,
+        )
+        failure_counts["vision_dependence_gate_rejected"] = vdep_stats["rejected"]
+        print(f"[vision_dependence_gate] {vdep_stats}", flush=True)
+
+    # --- RG vision-dependence check ---
+    # Single cross-model text-only call (OpenAI) per REVERSE_GROUND row.
+    # Non-RG rows pass through unconditionally. Separate model family from the Gemini teacher
+    # avoids self-selection bias. Error → conservative keep.
+    # When rg_leakage_correction_enabled: rejected rows where the only leakage is a color/shape
+    # token in the question are corrected (token stripped) and re-checked before final discard.
+    if tuning.rg_vdep_check_enabled and final_rows:
+        from .dev200_eval import apply_rg_vdep_check
+        final_rows, rg_vdep_stats = apply_rg_vdep_check(
+            final_rows,
+            model=str(tuning.rg_vdep_model),
+            workers=workers,
+            correction_enabled=tuning.rg_leakage_correction_enabled,
+        )
+        failure_counts["rg_vdep_rejected"] = rg_vdep_stats["rejected_rg"]
+        print(f"[rg_vdep_check] {rg_vdep_stats}", flush=True)
+
+    # --- RG leaky-label hard reject ---
+    # Structurally reject REVERSE_GROUND rows where the anchor_label contains a color
+    # or shape token. These rows expose the visual element's identity in the question
+    # text, making them answerable without the image. This is a zero-cost structural
+    # filter — no API calls — that directly targets the "leaky-label candidates" flagged
+    # in ita08 diagnostics (11–14 per variant, all non-corrected by the broken vdep check).
+    if tuning.rg_leaky_label_hard_reject_enabled and final_rows:
+        _rg_color_tokens: frozenset[str] = frozenset({
+            "red", "blue", "green", "brown", "white", "black", "gray", "grey",
+            "yellow", "orange", "purple", "pink", "silver", "gold",
+        })
+        _rg_shape_tokens: frozenset[str] = frozenset({
+            "rectangular", "circular", "square", "oval", "round",
+            "triangular", "hexagonal", "cylindrical", "spherical",
+            "wedge", "segment", "emblem", "badge", "bar",
+        })
+        pre_rg_reject = len(final_rows)
+
+        def _has_leaky_label(row: dict) -> bool:
+            if str(row.get("question_type") or "") != "REVERSE_GROUND":
+                return False
+            label_words = str(row.get("anchor_label") or "").lower().split()
+            return any(w in _rg_color_tokens or w in _rg_shape_tokens for w in label_words)
+
+        final_rows = [row for row in final_rows if not _has_leaky_label(row)]
+        rg_leaky_rejected = pre_rg_reject - len(final_rows)
+        failure_counts["rg_leaky_label_rejected"] = rg_leaky_rejected
+        print(
+            f"[rg_leaky_label_hard_reject] pre={pre_rg_reject} rejected={rg_leaky_rejected}"
+            f" remaining={len(final_rows)}",
+            flush=True,
+        )
+
+    print(
+        f"[stage:pipeline] finalize raw_results={len(raw_results)} final_rows={len(final_rows)} elapsed_s={time.time() - pipeline_start:.1f}",
+        flush=True,
     )
 
     write_jsonl(out_dir / "raw_results.jsonl", raw_results)
@@ -1322,7 +1566,8 @@ def run_anchor_stage(
     tuning = load_semantic_dev40_tuning()
     use_qwen_tag_backend = tuning.anchor_tag_discovery_backend == "qwen3_vl_vllm"
     use_qwen_anchor_backend = tuning.anchor_candidate_backend == "qwen3_vl_vllm"
-    tagger = None if use_qwen_tag_backend else FlorenceTagger(model_name=str(RUNTIME_MODELS["semantic_tagger"]), device=device)
+    use_independent_qwen_inventory = use_qwen_anchor_backend and tuning.qwen_anchor_inventory_mode == "independent_raw"
+    tagger = None if use_qwen_tag_backend or use_independent_qwen_inventory else FlorenceTagger(model_name=str(RUNTIME_MODELS["semantic_tagger"]), device=device)
     grounder = None if use_qwen_anchor_backend else GroundingDinoGrounder(device=device)
     qwen_grounder = (
         QwenAnchorGrounderVLLM(
@@ -1345,16 +1590,58 @@ def run_anchor_stage(
     grounded_anchor_rows: list[dict[str, Any]] = []
     best_anchor_by_node: dict[tuple[str, str], dict[str, Any]] = {}
     image_plans: list[dict[str, Any]] = []
+    tag_progress = _make_stage_progress_logger("anchor_tag_discovery", len(image_specs))
 
-    for spec in image_specs:
+    for spec_index, spec in enumerate(image_specs, start=1):
         image_nodes = nodes_by_image.get(spec["image_id"], [])
         if not image_nodes:
+            tag_progress.tick(spec_index, extra=f"image_id={spec['image_id']} skipped=no_resolvable_nodes")
             continue
         image = Image.open(spec["image_path"]).convert("RGB")
         context_boxes = [
             expand_box(list(node["bbox"]), image_width=image.width, image_height=image.height, scale=2.5)
             for node in image_nodes
         ]
+        if use_independent_qwen_inventory:
+            per_node_tags = {str(node["node_id"]): [] for node in image_nodes}
+            per_node_local_candidates = {str(node["node_id"]): [] for node in image_nodes}
+            for node, context_box in zip(image_nodes, context_boxes):
+                anchor_tag_rows.append(
+                    {
+                        "image_id": spec["image_id"],
+                        "node_id": node["node_id"],
+                        "caption": "",
+                        "raw_labels": [],
+                        "semantic_regions": [],
+                        "semantic_regions_mapped": [],
+                        "discovered_tags": [],
+                        "expanded_tags": [],
+                        "final_prompt_tags": [],
+                        "context_box": context_box,
+                        "inventory_mode": "independent_raw",
+                    }
+                )
+            image_plans.append(
+                {
+                    "spec": spec,
+                    "image_nodes": image_nodes,
+                    "image_size": (image.width, image.height),
+                    "selected_tags": [],
+                    "anchor_inventory_categories": [],
+                    "per_node_tags": per_node_tags,
+                    "per_node_local_candidates": per_node_local_candidates,
+                    "independent_inventory_prompt": (
+                        INDEPENDENT_QWEN_INVENTORY_PROMPT_ANTI_OCR
+                        if tuning.qwen_anti_ocr_prompt_enabled
+                        else INDEPENDENT_QWEN_INVENTORY_PROMPT
+                    ),
+                }
+            )
+            tag_progress.tick(
+                spec_index,
+                extra=f"image_id={spec['image_id']} nodes={len(image_nodes)} skipped=independent_raw",
+            )
+            continue
         context_crops = [image.crop(tuple(box)) for box in context_boxes]
         if use_qwen_tag_backend:
             local_vocab_mode = tuning.qwen_anchor_tag_discovery_vocab_mode
@@ -1363,7 +1650,13 @@ def run_anchor_stage(
                     image_id=f"{spec['image_id']}::{node['node_id']}",
                     image_obj=crop,
                     categories=list(QWEN_LOCAL_DISCOVERY_CATEGORIES) if local_vocab_mode == "constrained" else [],
-                    prompt_text=None if local_vocab_mode == "constrained" else OPEN_QWEN_LOCAL_DISCOVERY_PROMPT,
+                    prompt_text=None
+                    if local_vocab_mode == "constrained"
+                    else (
+                        OPEN_QWEN_LOCAL_DISCOVERY_PROMPT_COLOR_SPECIFIC
+                        if tuning.qwen_open_tag_prompt_mode == "color_specific"
+                        else OPEN_QWEN_LOCAL_DISCOVERY_PROMPT
+                    ),
                     enforce_allowed_labels=local_vocab_mode == "constrained",
                 )
                 for node, crop in zip(image_nodes, context_crops)
@@ -1444,33 +1737,248 @@ def run_anchor_stage(
                 "image_nodes": image_nodes,
                 "image_size": (image.width, image.height),
                 "selected_tags": selected_tags,
+                "anchor_inventory_categories": (
+                    list(QWEN_GLOBAL_INVENTORY_CATEGORIES)
+                    if use_qwen_anchor_backend and tuning.qwen_anchor_inventory_mode == "global_inventory"
+                    else selected_tags
+                ),
                 "per_node_tags": per_node_tags,
                 "per_node_local_candidates": per_node_local_candidates,
             }
         )
+        tag_progress.tick(
+            spec_index,
+            extra=(
+                f"image_id={spec['image_id']} nodes={len(image_nodes)} "
+                f"selected_tags={len(selected_tags)}"
+            ),
+        )
+    tag_progress.finish(extra=f"image_plans={len(image_plans)} anchor_tag_rows={len(anchor_tag_rows)}")
 
     image_anchors_by_image: dict[str, list[dict[str, Any]]] = {}
     if qwen_grounder is not None:
-        qwen_requests = [
-            QwenAnchorRequest(
-                image_id=str(plan["spec"]["image_id"]),
-                image_path=str(plan["spec"]["image_path"]),
-                categories=list(plan["selected_tags"]),
+        if use_independent_qwen_inventory:
+            pass_count = max(1, int(tuning.qwen_anchor_inventory_pass_count))
+            ground_progress = _make_stage_progress_logger("anchor_grounding", pass_count)
+            qwen_requests = [
+                QwenAnchorRequest(
+                    image_id=str(plan["spec"]["image_id"]),
+                    image_path=str(plan["spec"]["image_path"]),
+                    categories=[],
+                    prompt_text=str(plan["independent_inventory_prompt"]),
+                    enforce_allowed_labels=False,
+                    normalize_open_labels=True,
+                )
+                for plan in image_plans
+            ]
+            pass_results: list[dict[str, list[dict[str, Any]]]] = []
+            for pass_index in range(pass_count):
+                raw_grounded = qwen_grounder.detect_many(
+                    qwen_requests,
+                    sampling_temperature=float(tuning.qwen_anchor_inventory_temperature),
+                )
+                pass_results.append(raw_grounded)
+                raw_rows = sum(len(rows) for rows in raw_grounded.values())
+                ground_progress.tick(
+                    pass_index + 1,
+                    extra=f"pass={pass_index + 1}/{pass_count} images={len(raw_grounded)} raw_rows={raw_rows}",
+                )
+            merged_grounded = merge_qwen_inventory_passes(
+                pass_results,
+                iou_threshold=float(tuning.qwen_anchor_inventory_consensus_iou),
+                min_support=int(tuning.qwen_anchor_inventory_min_support),
             )
-            for plan in image_plans
-        ]
-        image_anchors_by_image = {
-            image_id: dedupe_anchor_rows(rows)
-            for image_id, rows in qwen_grounder.detect_many(qwen_requests).items()
-        }
+            image_anchors_by_image = {image_id: dedupe_anchor_rows(rows) for image_id, rows in merged_grounded.items()}
+            ground_progress.finish(
+                extra=f"images={len(image_anchors_by_image)} merged_candidates={sum(len(rows) for rows in image_anchors_by_image.values())}"
+            )
+
+            # --- Structural fallback for degenerate inventory results ---
+            if tuning.qwen_structural_fallback_enabled:
+                from .qwen_anchor_vllm import STRUCTURAL_FALLBACK_QWEN_PROMPT, STRUCTURAL_FALLBACK_QWEN_PROMPT_ANTI_OCR, is_degenerate_inventory
+                _structural_fallback_prompt = (
+                    STRUCTURAL_FALLBACK_QWEN_PROMPT_ANTI_OCR
+                    if tuning.qwen_anti_ocr_prompt_enabled
+                    else STRUCTURAL_FALLBACK_QWEN_PROMPT
+                )
+                degenerate_ids = {
+                    image_id
+                    for image_id, rows in image_anchors_by_image.items()
+                    if is_degenerate_inventory(rows, threshold=tuning.qwen_degenerate_label_threshold)
+                }
+                # Also flag images entirely absent from results (Qwen returned nothing)
+                degenerate_ids |= {
+                    req.image_id for req in qwen_requests if req.image_id not in image_anchors_by_image
+                }
+                if degenerate_ids:
+                    fallback_requests = [
+                        QwenAnchorRequest(
+                            image_id=req.image_id,
+                            image_path=req.image_path,
+                            categories=[],
+                            prompt_text=_structural_fallback_prompt,
+                            enforce_allowed_labels=False,
+                            normalize_open_labels=True,
+                        )
+                        for req in qwen_requests
+                        if req.image_id in degenerate_ids
+                    ]
+                    fallback_grounded = qwen_grounder.detect_many(
+                        fallback_requests,
+                        sampling_temperature=0.10,
+                    )
+                    for image_id, fallback_rows in fallback_grounded.items():
+                        if fallback_rows:
+                            existing = image_anchors_by_image.get(image_id, [])
+                            image_anchors_by_image[image_id] = dedupe_anchor_rows(existing + fallback_rows)
+                    print(
+                        f"[structural_fallback] degenerate={len(degenerate_ids)} "
+                        f"recovered={sum(1 for iid in degenerate_ids if image_anchors_by_image.get(iid))}",
+                        flush=True,
+                    )
+
+            # --- Second-pass for low-yield images ---
+            if tuning.qwen_min_anchor_detections_per_image > 0:
+                low_yield_ids = {
+                    image_id
+                    for image_id, rows in image_anchors_by_image.items()
+                    if len(rows) < tuning.qwen_min_anchor_detections_per_image
+                }
+                # Also flag images with no results at all
+                low_yield_ids |= {
+                    req.image_id for req in qwen_requests if req.image_id not in image_anchors_by_image
+                }
+                if low_yield_ids:
+                    second_pass_requests = [req for req in qwen_requests if req.image_id in low_yield_ids]
+                    second_pass_temp = min(float(tuning.qwen_anchor_inventory_temperature) + 0.25, 1.0)
+                    second_pass_grounded = qwen_grounder.detect_many(
+                        second_pass_requests,
+                        sampling_temperature=second_pass_temp,
+                    )
+                    for image_id, second_rows in second_pass_grounded.items():
+                        combined = merge_qwen_inventory_passes(
+                            [
+                                {image_id: image_anchors_by_image.get(image_id, [])},
+                                {image_id: second_rows},
+                            ],
+                            iou_threshold=float(tuning.qwen_anchor_inventory_consensus_iou),
+                            min_support=1,
+                        )
+                        image_anchors_by_image[image_id] = dedupe_anchor_rows(combined.get(image_id, []))
+                    print(
+                        f"[second_pass_low_yield] low_yield={len(low_yield_ids)} "
+                        f"temp={second_pass_temp:.2f}",
+                        flush=True,
+                    )
+        else:
+            ground_progress = _make_stage_progress_logger("anchor_grounding", len(image_plans))
+            qwen_requests = [
+                QwenAnchorRequest(
+                    image_id=str(plan["spec"]["image_id"]),
+                    image_path=str(plan["spec"]["image_path"]),
+                    categories=list(plan["anchor_inventory_categories"]),
+                )
+                for plan in image_plans
+            ]
+            raw_grounded = qwen_grounder.detect_many(qwen_requests, progress_logger=ground_progress)
+            image_anchors_by_image = {image_id: dedupe_anchor_rows(rows) for image_id, rows in raw_grounded.items()}
+            ground_progress.finish(extra=f"images={len(image_anchors_by_image)}")
     elif grounder is not None:
+        ground_progress = _make_stage_progress_logger("anchor_grounding", len(image_plans))
         for plan in image_plans:
             image = Image.open(plan["spec"]["image_path"]).convert("RGB")
             image_anchors: list[dict[str, Any]] = []
             for tag in plan["selected_tags"]:
                 image_anchors.extend(grounder.detect(image, tag, threshold=grounding_threshold))
             image_anchors_by_image[str(plan["spec"]["image_id"])] = dedupe_anchor_rows(image_anchors)
+            ground_progress.tick(
+                len(image_anchors_by_image),
+                extra=f"image_id={plan['spec']['image_id']} candidates={len(image_anchors_by_image[str(plan['spec']['image_id'])])}",
+            )
+        ground_progress.finish(extra=f"images={len(image_anchors_by_image)}")
 
+    # --- Degenerate anchor label filter ---
+    # Removes anchors whose label is too generic (e.g. 'object part', 'surface', 'area')
+    # or looks like OCR-copied text content (e.g. 'DAN BROWN BREWING CO') before they can
+    # become QA candidates. Prevents these anchors from ever reaching Gemini generation.
+    if tuning.qwen_degenerate_anchor_filter_enabled:
+        total_filtered = 0
+        for image_id in list(image_anchors_by_image.keys()):
+            before = image_anchors_by_image[image_id]
+            after = [
+                row for row in before
+                if not is_degenerate_anchor_label(str(row.get("label") or ""))
+                and not is_ocr_text_label(str(row.get("label") or ""))
+            ]
+            total_filtered += len(before) - len(after)
+            image_anchors_by_image[image_id] = after
+        print(f"[degenerate_anchor_filter] removed={total_filtered} anchors", flush=True)
+
+    # --- Anchor label groundback check ---
+    # Re-runs Qwen with only the anchor label text to verify the label uniquely identifies
+    # the element in the image. Anchors where Qwen cannot relocate the element (low IoU
+    # between the returned bbox and the original) receive a scoring penalty, making them
+    # less likely to reach candidate selection. No hard filter — penalty-only approach.
+    if tuning.anchor_label_groundback_enabled and qwen_grounder is not None and image_anchors_by_image:
+        path_by_image_id = {
+            str(plan["spec"]["image_id"]): str(plan["spec"]["image_path"])
+            for plan in image_plans
+        }
+        groundback_results = qwen_grounder.groundback_check_many(
+            image_anchors_by_image,
+            image_path_by_image=path_by_image_id,
+        )
+        gb_total = gb_failed = 0
+        iou_threshold = float(tuning.anchor_label_groundback_iou_threshold)
+        for image_id, anchor_results in groundback_results.items():
+            anchors = image_anchors_by_image.get(image_id, [])
+            for anchor_idx, gb_iou in anchor_results:
+                if anchor_idx < len(anchors):
+                    anchors[anchor_idx]["groundback_iou"] = gb_iou
+                    failed = gb_iou < iou_threshold
+                    anchors[anchor_idx]["groundback_failed"] = failed
+                    if failed:
+                        anchors[anchor_idx]["score"] = max(
+                            0.0, float(anchors[anchor_idx].get("score") or 0.0) - 0.20
+                        )
+                        gb_failed += 1
+                    gb_total += 1
+        print(
+            f"[anchor_groundback] checked={gb_total} failed={gb_failed} iou_threshold={iou_threshold:.2f}",
+            flush=True,
+        )
+
+    if use_independent_qwen_inventory:
+        anchor_tag_rows_by_key = {
+            (str(row["image_id"]), str(row["node_id"])): row
+            for row in anchor_tag_rows
+        }
+        for plan in image_plans:
+            image_id = str(plan["spec"]["image_id"])
+            inventory_rows = image_anchors_by_image.get(image_id, [])
+            inventory_tags = dedupe_preserve_order(
+                [
+                    normalize_independent_anchor_label(str(row.get("raw_label") or row.get("label") or ""))
+                    or str(row.get("label") or "").strip().lower()
+                    for row in inventory_rows
+                    if str(row.get("raw_label") or row.get("label") or "").strip()
+                ]
+            )[:max_tags_per_image]
+            inventory_caption = "; ".join(inventory_tags[:6])
+            plan["selected_tags"] = list(inventory_tags)
+            for node in plan["image_nodes"]:
+                node_id = str(node["node_id"])
+                plan["per_node_tags"][node_id] = list(inventory_tags)
+                row = anchor_tag_rows_by_key.get((image_id, node_id))
+                if row is None:
+                    continue
+                row["caption"] = inventory_caption
+                row["raw_labels"] = list(inventory_tags)
+                row["discovered_tags"] = list(inventory_tags)
+                row["final_prompt_tags"] = list(inventory_tags)
+
+    select_progress = _make_stage_progress_logger("anchor_candidate_selection", len(resolvable_nodes))
+    selected_count = 0
     for plan in image_plans:
         spec = plan["spec"]
         image_nodes = plan["image_nodes"]
@@ -1562,6 +2070,15 @@ def run_anchor_stage(
             )
             if filtered_candidates:
                 best_anchor_by_node[(spec["image_id"], str(node["node_id"]))] = filtered_candidates[0]
+            selected_count += 1
+            select_progress.tick(
+                selected_count,
+                extra=(
+                    f"image_id={spec['image_id']} node_id={node['node_id']} "
+                    f"top_candidates={len(filtered_candidates[:5])}"
+                ),
+            )
+    select_progress.finish(extra=f"grounded_rows={len(grounded_anchor_rows)} best_anchors={len(best_anchor_by_node)}")
     if sam3_refiner is not None:
         sam3_refiner.close()
     if grounder is not None:
@@ -1597,11 +2114,13 @@ def build_verified_tuples(
     word_tuple_count = 0
     merged_sign_tuple_count = 0
     subsumed_tuple_count = 0
+    verify_progress = _make_stage_progress_logger("verified_tuple_build", len(image_specs))
 
-    for spec in image_specs:
+    for spec_index, spec in enumerate(image_specs, start=1):
         image_nodes = nodes_by_image.get(spec["image_id"], [])
         all_image_nodes = all_nodes_by_image.get(spec["image_id"], [])
         if not image_nodes:
+            verify_progress.tick(spec_index, extra=f"image_id={spec['image_id']} skipped=no_nodes")
             continue
         image_width = int(image_nodes[0]["image_width"])
         image_height = int(image_nodes[0]["image_height"])
@@ -1676,6 +2195,7 @@ def build_verified_tuples(
                     "anchor_local_mode": str(anchor_local["mode"]),
                     "anchor_box": [round(float(v), 2) for v in best_anchor["box"]],
                     "anchor_score": float(best_anchor["score"]),
+                    "anchor_color": str(extract_anchor_color(str(best_anchor["label"])) or ""),
                     "anchor_category": categorize_anchor(str(best_anchor["label"])),
                     "anchor_source": str(best_anchor.get("source") or "grounding_dino"),
                     "anchor_label_source": "grounding",
@@ -1717,6 +2237,13 @@ def build_verified_tuples(
         apply_uniqueness(image_tuples)
         fill_competing_tuple_counts(image_tuples)
         tuples.extend(image_tuples)
+        verify_progress.tick(
+            spec_index,
+            extra=(
+                f"image_id={spec['image_id']} image_tuples={len(image_tuples)} "
+                f"cum_tuples={len(tuples)}"
+            ),
+        )
 
     debug = {
         "word_tuples": word_tuple_count,
@@ -1725,6 +2252,7 @@ def build_verified_tuples(
         "subsumed_tuples": subsumed_tuple_count,
         "dropped_no_anchor": dropped_no_anchor,
     }
+    verify_progress.finish(extra=f"tuples={len(tuples)} dropped_no_anchor={dropped_no_anchor}")
     return tuples, debug
 
 
@@ -1949,6 +2477,7 @@ def build_sign_tuples_for_image(
                 "anchor_local_mode": str(anchor_local["mode"]),
                 "anchor_box": [round(float(v), 2) for v in anchor["box"]],
                 "anchor_score": float(anchor["score"]),
+                "anchor_color": str(extract_anchor_color(str(anchor["label"])) or ""),
                 "anchor_category": categorize_anchor(str(anchor["label"])),
                 "anchor_source": str(anchor.get("source") or "grounding_dino"),
                 "relation": "on",
@@ -1997,6 +2526,7 @@ def fill_competing_tuple_counts(tuple_rows: list[dict[str, Any]]) -> None:
         row_anchor_box = [float(value) for value in row.get("anchor_box") or []]
         row_relation = str(row.get("relation") or "")
         row_anchor_label = normalize_answer(str(row.get("anchor_label") or ""))
+        row_answer = normalize_answer(str(row.get("answer_normalized") or row.get("answer") or ""))
         row_coarse = normalize_answer(str(row.get("location_phrase") or ""))
         row_specific = normalize_answer(str(row.get("specific_location_phrase") or ""))
         row_bucket = str(row_kd.get("local_text_bucket_key") or "")
@@ -2005,6 +2535,9 @@ def fill_competing_tuple_counts(tuple_rows: list[dict[str, Any]]) -> None:
         coarse_region_competitors = 0
         bucket_competitors = 0
         competing = 0
+        same_anchor_same_answer_count = 1 if row_answer else 0
+        same_anchor_same_answer_nonoverlap_instances = 1 if row_answer else 0
+        same_anchor_distinct_answers: set[str] = {row_answer} if row_answer else set()
         for other in tuple_rows:
             if other["tuple_id"] == row["tuple_id"]:
                 continue
@@ -2015,10 +2548,17 @@ def fill_competing_tuple_counts(tuple_rows: list[dict[str, Any]]) -> None:
             other_specific = normalize_answer(str(other.get("specific_location_phrase") or ""))
             same_specific = bool(row_specific and other_specific and row_specific == other_specific)
             same_bucket = bool(row_bucket and row_bucket == str(other_kd.get("local_text_bucket_key") or ""))
+            other_answer = normalize_answer(str(other.get("answer_normalized") or other.get("answer") or ""))
             other_anchor_box = [float(value) for value in other.get("anchor_box") or []]
             overlap = _bbox_iou(row_anchor_box, other_anchor_box) if len(row_anchor_box) >= 4 and len(other_anchor_box) >= 4 else 0.0
             if same_relation and same_anchor_label:
                 anchor_label_competitors += 1
+                if other_answer:
+                    same_anchor_distinct_answers.add(other_answer)
+                if row_answer and other_answer == row_answer:
+                    same_anchor_same_answer_count += 1
+                    if overlap < 0.35:
+                        same_anchor_same_answer_nonoverlap_instances += 1
             if same_relation and overlap >= 0.45:
                 anchor_overlap_competitors += 1
             if same_relation and same_coarse:
@@ -2037,6 +2577,11 @@ def fill_competing_tuple_counts(tuple_rows: list[dict[str, Any]]) -> None:
         row_kd["coarse_region_competitors"] = coarse_region_competitors
         row_kd["bucket_competitors"] = bucket_competitors
         row_kd["competing_tuples"] = competing
+        row_kd["same_anchor_text_count"] = anchor_overlap_competitors + 1
+        row_kd["same_anchor_same_answer_count"] = same_anchor_same_answer_count
+        row_kd["same_anchor_same_answer_nonoverlap_instances"] = same_anchor_same_answer_nonoverlap_instances
+        row_kd["same_anchor_distinct_answer_count"] = len(same_anchor_distinct_answers)
+        row_kd["diffuse_same_anchor_scene"] = bool(anchor_label_competitors >= 2 and anchor_overlap_competitors <= 1)
 
 
 def apply_uniqueness(tuple_rows: list[dict[str, Any]]) -> None:

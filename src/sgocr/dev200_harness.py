@@ -5,7 +5,15 @@ from pathlib import Path
 
 from .bootstrap import build_and_write_dev_subset
 from .bootstrap_kd import materialize_bootstrap_kd_dataset
-from .dev200_eval import _load_jsonl, _write_frontier_eval_index, compute_frontier_agreement, prepare_bundle_evals, run_frontier_benchmark
+from .dev200_eval import (
+    _load_jsonl,
+    _write_frontier_eval_index,
+    compute_frontier_agreement,
+    compute_frontier_ambiguity_agreement,
+    prepare_bundle_evals,
+    run_frontier_ambiguity_eval,
+    run_frontier_benchmark,
+)
 from .dev40_complete import build_dev40_complete_dataset
 from .full_pipeline_dev40 import build_dev40_semantic_dataset
 from .paths import OCR_SPATIAL_QA_FINAL_ROOT, OCR_SPATIAL_QA_INTERMEDIATE_ROOT, OCR_SPATIAL_QA_RAW_ROOT
@@ -77,6 +85,17 @@ def parse_args() -> argparse.Namespace:
 
     ap_agree = sub.add_parser("compute-frontier-agreement")
     ap_agree.add_argument("--benchmark-dir", required=True)
+
+    ap_amb = sub.add_parser("run-frontier-ambiguity-eval")
+    ap_amb.add_argument("--experiment-dir", required=True)
+    ap_amb.add_argument("--model", action="append", dest="models", default=[])
+    ap_amb.add_argument("--limit", type=int, default=0)
+    ap_amb.add_argument("--question-type", action="append", dest="question_types", default=[])
+    ap_amb.add_argument("--out-dir", default="")
+    ap_amb.add_argument("--workers", type=int, default=1)
+
+    ap_amb_agree = sub.add_parser("compute-frontier-ambiguity-agreement")
+    ap_amb_agree.add_argument("--benchmark-dir", required=True)
 
     ap_backfill = sub.add_parser("backfill-frontier-evals-index", help="Rebuild frontier_evals_index.jsonl from existing evals/ dirs.")
     ap_backfill.add_argument("--experiment-dir", required=True, help="Path to a final experiment directory.")
@@ -183,6 +202,21 @@ def main() -> None:
 
     if args.cmd == "compute-frontier-agreement":
         compute_frontier_agreement(benchmark_dir=Path(args.benchmark_dir))
+        return
+
+    if args.cmd == "run-frontier-ambiguity-eval":
+        run_frontier_ambiguity_eval(
+            experiment_dir=Path(args.experiment_dir),
+            model_specs=list(args.models),
+            limit=int(args.limit),
+            only_question_types=list(args.question_types),
+            out_dir=Path(args.out_dir) if args.out_dir else None,
+            workers=int(args.workers),
+        )
+        return
+
+    if args.cmd == "compute-frontier-ambiguity-agreement":
+        compute_frontier_ambiguity_agreement(benchmark_dir=Path(args.benchmark_dir))
         return
 
     if args.cmd == "backfill-frontier-evals-index":

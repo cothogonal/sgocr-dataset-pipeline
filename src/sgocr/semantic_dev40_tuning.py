@@ -31,6 +31,11 @@ class SemanticDev40Tuning:
     anchor_tag_discovery_backend: str = "florence"
     qwen_anchor_tag_discovery_vocab_mode: str = "constrained"
     anchor_candidate_backend: str = "florence_dino"
+    qwen_anchor_inventory_mode: str = "selected_tags"
+    qwen_anchor_inventory_pass_count: int = 1
+    qwen_anchor_inventory_temperature: float = 0.0
+    qwen_anchor_inventory_consensus_iou: float = 0.55
+    qwen_anchor_inventory_min_support: int = 1
     detector_mode: str = "ppocr"
     detector_box_thresh: float = 0.50
     detector_unclip_ratio: float = 1.50
@@ -92,6 +97,40 @@ class SemanticDev40Tuning:
     reverse_ground_answer_style: str = "standard"
     anchor_relabel_generic_mode: str = "standard"
     generic_anchor_retry_penalty: float = 0.10
+    sibling_disambiguation_enabled: bool = False
+    anchor_reference_color_enabled: bool = False
+    suppress_anchor_local_without_competing_text: bool = False
+    repeated_anchor_grouping_enabled: bool = False
+    repeated_anchor_group_min_instances: int = 3
+    cheap_ambiguity_proxy_enabled: bool = False
+    cheap_ambiguity_proxy_reject_score: int = 6
+    answer_leakage_filter_enabled: bool = False
+    spatial_min_centroid_offset: float = 0.0
+    per_image_anchor_diversity_bonus: float = 0.0
+    anchor_color_mechanical_answer_enabled: bool = False
+    qwen_structural_fallback_enabled: bool = False
+    qwen_degenerate_label_threshold: float = 0.92
+    qwen_min_anchor_detections_per_image: int = 0
+    qwen_anti_ocr_prompt_enabled: bool = False
+    qwen_degenerate_anchor_filter_enabled: bool = False
+    rg_structural_anchor_filter_enabled: bool = False
+    upstream_centroid_filter_enabled: bool = False
+    inline_frontier_gate_enabled: bool = False
+    inline_frontier_gate_word_f1_floor: float = -1.0
+    vision_dependence_gate_enabled: bool = False
+    inline_frontier_gate_question_types: str = "all"
+    rg_vdep_check_enabled: bool = False
+    rg_vdep_model: str = "gemini:gemini-3-flash-preview"
+    rg_leakage_correction_enabled: bool = False
+    rg_leaky_label_hard_reject_enabled: bool = False
+    rg_candidate_oversample_boost: float = 0.0
+    rg_per_image_hard_cap: int = 1
+    property_candidate_selection_bonus: float = 0.0
+    anchor_label_groundback_enabled: bool = False
+    anchor_label_groundback_iou_threshold: float = 0.35
+    qwen_open_tag_prompt_mode: str = "basic"
+    teacher_answer_probe_count: int = 1
+    teacher_answer_probe_temperature: float = 0.35
     qwen_anchor_model: str = "Qwen/Qwen3-VL-8B-Instruct-FP8"
     qwen_anchor_gpu_memory_utilization: float = 0.90
     qwen_anchor_batch_size: int = 2
@@ -113,6 +152,11 @@ def load_semantic_dev40_tuning() -> SemanticDev40Tuning:
         anchor_tag_discovery_backend=_env_str("SGOCR_ANCHOR_TAG_DISCOVERY_BACKEND", "florence"),
         qwen_anchor_tag_discovery_vocab_mode=_env_str("SGOCR_QWEN_ANCHOR_TAG_DISCOVERY_VOCAB_MODE", "constrained"),
         anchor_candidate_backend=_env_str("SGOCR_ANCHOR_CANDIDATE_BACKEND", "florence_dino"),
+        qwen_anchor_inventory_mode=_env_str("SGOCR_QWEN_ANCHOR_INVENTORY_MODE", "selected_tags"),
+        qwen_anchor_inventory_pass_count=_env_int("SGOCR_QWEN_ANCHOR_INVENTORY_PASS_COUNT", 1),
+        qwen_anchor_inventory_temperature=_env_float("SGOCR_QWEN_ANCHOR_INVENTORY_TEMPERATURE", 0.0),
+        qwen_anchor_inventory_consensus_iou=_env_float("SGOCR_QWEN_ANCHOR_INVENTORY_CONSENSUS_IOU", 0.55),
+        qwen_anchor_inventory_min_support=_env_int("SGOCR_QWEN_ANCHOR_INVENTORY_MIN_SUPPORT", 1),
         detector_mode=_env_str("SGOCR_DETECTOR_MODE", "ppocr"),
         detector_box_thresh=_env_float("SGOCR_DETECTOR_BOX_THRESH", 0.50),
         detector_unclip_ratio=_env_float("SGOCR_DETECTOR_UNCLIP_RATIO", 1.50),
@@ -174,6 +218,40 @@ def load_semantic_dev40_tuning() -> SemanticDev40Tuning:
         reverse_ground_answer_style=_env_str("SGOCR_REVERSE_GROUND_ANSWER_STYLE", "standard"),
         anchor_relabel_generic_mode=_env_str("SGOCR_ANCHOR_RELABEL_GENERIC_MODE", "standard"),
         generic_anchor_retry_penalty=_env_float("SGOCR_GENERIC_ANCHOR_RETRY_PENALTY", 0.10),
+        sibling_disambiguation_enabled=_env_int("SGOCR_SIBLING_DISAMBIGUATION_ENABLED", 0) != 0,
+        anchor_reference_color_enabled=_env_int("SGOCR_ANCHOR_REFERENCE_COLOR_ENABLED", 0) != 0,
+        suppress_anchor_local_without_competing_text=_env_int("SGOCR_SUPPRESS_ANCHOR_LOCAL_WITHOUT_COMPETING_TEXT", 0) != 0,
+        repeated_anchor_grouping_enabled=_env_int("SGOCR_REPEATED_ANCHOR_GROUPING_ENABLED", 0) != 0,
+        repeated_anchor_group_min_instances=_env_int("SGOCR_REPEATED_ANCHOR_GROUP_MIN_INSTANCES", 3),
+        cheap_ambiguity_proxy_enabled=_env_int("SGOCR_CHEAP_AMBIGUITY_PROXY_ENABLED", 0) != 0,
+        cheap_ambiguity_proxy_reject_score=_env_int("SGOCR_CHEAP_AMBIGUITY_PROXY_REJECT_SCORE", 6),
+        answer_leakage_filter_enabled=_env_int("SGOCR_ANSWER_LEAKAGE_FILTER_ENABLED", 0) != 0,
+        spatial_min_centroid_offset=_env_float("SGOCR_SPATIAL_MIN_CENTROID_OFFSET", 0.0),
+        per_image_anchor_diversity_bonus=_env_float("SGOCR_PER_IMAGE_ANCHOR_DIVERSITY_BONUS", 0.0),
+        anchor_color_mechanical_answer_enabled=_env_int("SGOCR_ANCHOR_COLOR_MECHANICAL_ANSWER_ENABLED", 0) != 0,
+        qwen_structural_fallback_enabled=_env_int("SGOCR_QWEN_STRUCTURAL_FALLBACK_ENABLED", 0) != 0,
+        qwen_degenerate_label_threshold=_env_float("SGOCR_QWEN_DEGENERATE_LABEL_THRESHOLD", 0.92),
+        qwen_min_anchor_detections_per_image=_env_int("SGOCR_QWEN_MIN_ANCHOR_DETECTIONS_PER_IMAGE", 0),
+        qwen_anti_ocr_prompt_enabled=_env_int("SGOCR_QWEN_ANTI_OCR_PROMPT_ENABLED", 0) != 0,
+        qwen_degenerate_anchor_filter_enabled=_env_int("SGOCR_QWEN_DEGENERATE_ANCHOR_FILTER_ENABLED", 0) != 0,
+        rg_structural_anchor_filter_enabled=_env_int("SGOCR_RG_STRUCTURAL_ANCHOR_FILTER_ENABLED", 0) != 0,
+        upstream_centroid_filter_enabled=_env_int("SGOCR_UPSTREAM_CENTROID_FILTER_ENABLED", 0) != 0,
+        inline_frontier_gate_enabled=_env_int("SGOCR_INLINE_FRONTIER_GATE_ENABLED", 0) != 0,
+        inline_frontier_gate_word_f1_floor=_env_float("SGOCR_INLINE_FRONTIER_GATE_WORD_F1_FLOOR", -1.0),
+        vision_dependence_gate_enabled=_env_int("SGOCR_VISION_DEPENDENCE_GATE_ENABLED", 0) != 0,
+        inline_frontier_gate_question_types=_env_str("SGOCR_INLINE_FRONTIER_GATE_QUESTION_TYPES", "all"),
+        rg_vdep_check_enabled=_env_int("SGOCR_RG_VDEP_CHECK_ENABLED", 0) != 0,
+        rg_vdep_model=_env_str("SGOCR_RG_VDEP_MODEL", "gemini:gemini-3-flash-preview"),
+        rg_leakage_correction_enabled=_env_int("SGOCR_RG_LEAKAGE_CORRECTION_ENABLED", 0) != 0,
+        rg_leaky_label_hard_reject_enabled=_env_int("SGOCR_RG_LEAKY_LABEL_HARD_REJECT_ENABLED", 0) != 0,
+        rg_candidate_oversample_boost=_env_float("SGOCR_RG_CANDIDATE_OVERSAMPLE_BOOST", 0.0),
+        rg_per_image_hard_cap=_env_int("SGOCR_RG_PER_IMAGE_HARD_CAP", 1),
+        property_candidate_selection_bonus=_env_float("SGOCR_PROPERTY_CANDIDATE_SELECTION_BONUS", 0.0),
+        anchor_label_groundback_enabled=_env_int("SGOCR_ANCHOR_LABEL_GROUNDBACK_ENABLED", 0) != 0,
+        anchor_label_groundback_iou_threshold=_env_float("SGOCR_ANCHOR_LABEL_GROUNDBACK_IOU_THRESHOLD", 0.35),
+        qwen_open_tag_prompt_mode=_env_str("SGOCR_QWEN_OPEN_TAG_PROMPT_MODE", "basic"),
+        teacher_answer_probe_count=_env_int("SGOCR_TEACHER_ANSWER_PROBE_COUNT", 1),
+        teacher_answer_probe_temperature=_env_float("SGOCR_TEACHER_ANSWER_PROBE_TEMPERATURE", 0.35),
         qwen_anchor_model=_env_str("SGOCR_QWEN_ANCHOR_MODEL", "Qwen/Qwen3-VL-8B-Instruct-FP8"),
         qwen_anchor_gpu_memory_utilization=_env_float("SGOCR_QWEN_ANCHOR_GPU_MEMORY_UTILIZATION", 0.90),
         qwen_anchor_batch_size=_env_int("SGOCR_QWEN_ANCHOR_BATCH_SIZE", 2),
@@ -195,14 +273,42 @@ def load_semantic_dev40_tuning() -> SemanticDev40Tuning:
         )
     if tuning.anchor_candidate_backend not in {"florence_dino", "qwen3_vl_vllm"}:
         raise ValueError(f"Unsupported SGOCR_ANCHOR_CANDIDATE_BACKEND: {tuning.anchor_candidate_backend}")
+    if tuning.qwen_anchor_inventory_mode not in {"selected_tags", "global_inventory", "independent_raw"}:
+        raise ValueError(f"Unsupported SGOCR_QWEN_ANCHOR_INVENTORY_MODE: {tuning.qwen_anchor_inventory_mode}")
+    if tuning.qwen_anchor_inventory_pass_count < 1:
+        raise ValueError("SGOCR_QWEN_ANCHOR_INVENTORY_PASS_COUNT must be >= 1")
+    if not 0.0 <= tuning.qwen_anchor_inventory_temperature <= 1.5:
+        raise ValueError("SGOCR_QWEN_ANCHOR_INVENTORY_TEMPERATURE must be in [0, 1.5]")
+    if not 0.0 < tuning.qwen_anchor_inventory_consensus_iou <= 1.0:
+        raise ValueError("SGOCR_QWEN_ANCHOR_INVENTORY_CONSENSUS_IOU must be in (0, 1]")
+    if tuning.qwen_anchor_inventory_min_support < 1:
+        raise ValueError("SGOCR_QWEN_ANCHOR_INVENTORY_MIN_SUPPORT must be >= 1")
     if tuning.detector_mode not in {"ppocr", "ppocr_craft_ensemble"}:
         raise ValueError(f"Unsupported SGOCR_DETECTOR_MODE: {tuning.detector_mode}")
-    if tuning.location_wording_mode not in {"lite", "balanced", "varied", "rich_local"}:
+    if tuning.location_wording_mode not in {"lite", "balanced", "varied", "rich_local", "finalv0"}:
         raise ValueError(f"Unsupported SGOCR_LOCATION_WORDING_MODE: {tuning.location_wording_mode}")
     if tuning.reverse_ground_answer_style not in {"standard", "frontier", "frontier_rich"}:
         raise ValueError(f"Unsupported SGOCR_REVERSE_GROUND_ANSWER_STYLE: {tuning.reverse_ground_answer_style}")
     if tuning.anchor_relabel_generic_mode not in {"standard", "anti_generic"}:
         raise ValueError(f"Unsupported SGOCR_ANCHOR_RELABEL_GENERIC_MODE: {tuning.anchor_relabel_generic_mode}")
+    if tuning.qwen_open_tag_prompt_mode not in {"basic", "color_specific"}:
+        raise ValueError(f"Unsupported SGOCR_QWEN_OPEN_TAG_PROMPT_MODE: {tuning.qwen_open_tag_prompt_mode}")
+    if tuning.repeated_anchor_group_min_instances < 2:
+        raise ValueError("SGOCR_REPEATED_ANCHOR_GROUP_MIN_INSTANCES must be >= 2")
+    if tuning.cheap_ambiguity_proxy_reject_score < 1:
+        raise ValueError("SGOCR_CHEAP_AMBIGUITY_PROXY_REJECT_SCORE must be >= 1")
+    if not 0.0 <= tuning.spatial_min_centroid_offset <= 0.5:
+        raise ValueError("SGOCR_SPATIAL_MIN_CENTROID_OFFSET must be in [0, 0.5]")
+    if tuning.inline_frontier_gate_word_f1_floor != -1.0 and not (
+        0.0 <= tuning.inline_frontier_gate_word_f1_floor <= 1.0
+    ):
+        raise ValueError("SGOCR_INLINE_FRONTIER_GATE_WORD_F1_FLOOR must be -1.0 (disabled) or in [0, 1]")
+    if tuning.per_image_anchor_diversity_bonus < 0.0:
+        raise ValueError("SGOCR_PER_IMAGE_ANCHOR_DIVERSITY_BONUS must be >= 0")
+    if not 0.0 <= tuning.qwen_degenerate_label_threshold <= 1.0:
+        raise ValueError("SGOCR_QWEN_DEGENERATE_LABEL_THRESHOLD must be in [0, 1]")
+    if tuning.qwen_min_anchor_detections_per_image < 0:
+        raise ValueError("SGOCR_QWEN_MIN_ANCHOR_DETECTIONS_PER_IMAGE must be >= 0")
     if tuning.teacher_strictness not in {"strict", "very_strict"}:
         raise ValueError(f"Unsupported SGOCR_TEACHER_STRICTNESS: {tuning.teacher_strictness}")
     if tuning.gemini_api_mode not in {"sync", "batch"}:
@@ -239,6 +345,10 @@ def load_semantic_dev40_tuning() -> SemanticDev40Tuning:
         raise ValueError("Consensus thresholds must be > 0")
     if tuning.anchor_support_bonus < 0:
         raise ValueError("SGOCR_ANCHOR_SUPPORT_BONUS must be >= 0")
+    if tuning.teacher_answer_probe_count < 1:
+        raise ValueError("SGOCR_TEACHER_ANSWER_PROBE_COUNT must be >= 1")
+    if not 0.0 <= tuning.teacher_answer_probe_temperature <= 1.5:
+        raise ValueError("SGOCR_TEACHER_ANSWER_PROBE_TEMPERATURE must be in [0,1.5]")
     if not 0.0 <= tuning.reverse_ground_directional_local_bias <= 1.0:
         raise ValueError("SGOCR_REVERSE_GROUND_DIRECTIONAL_LOCAL_BIAS must be in [0,1]")
     if not 0.0 <= tuning.reverse_ground_on_local_bias <= 1.0:

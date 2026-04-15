@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +19,49 @@ DEFAULT_NEMOTRON_BATCH_SIZE = 8
 DEFAULT_NEMOTRON_RECOGNIZER_CHUNK = 256
 DEFAULT_NEMOTRON_RELATIONAL_CHUNK = 256
 DEFAULT_NEMOTRON_INFER_LENGTH = 1024
+
+
+class _StageProgressLogger:
+    def __init__(self, stage_name: str, total: int) -> None:
+        self.stage_name = str(stage_name)
+        self.total = max(0, int(total))
+        self._start = time.time()
+        self._last_fraction = -1
+        self._path = Path(os.environ["SGOCR_PROGRESS_LOG_PATH"]).expanduser() if os.environ.get("SGOCR_PROGRESS_LOG_PATH") else None
+
+    def _emit(self, message: str) -> None:
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%S")
+        line = f"[{stamp}] [stage:{self.stage_name}] {message}"
+        print(line, flush=True)
+        if self._path is not None:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            with self._path.open("a", encoding="utf-8") as f:
+                f.write(line + "\n")
+
+    def start(self) -> None:
+        self._emit(f"start total={self.total}")
+
+    def tick(self, completed: int, *, extra: str = "") -> None:
+        if self.total <= 0:
+            return
+        completed = max(0, int(completed))
+        fraction = min(100, int((completed * 100) / self.total))
+        if completed < self.total and fraction <= self._last_fraction:
+            return
+        if completed < self.total and fraction < 1:
+            return
+        self._last_fraction = fraction
+        elapsed = max(time.time() - self._start, 1e-6)
+        rate = completed / elapsed if completed > 0 else 0.0
+        suffix = f" {extra}" if extra else ""
+        self._emit(
+            f"progress completed={completed}/{self.total} pct={fraction}% elapsed_s={elapsed:.1f} rate_per_s={rate:.2f}{suffix}"
+        )
+
+    def finish(self, *, extra: str = "") -> None:
+        elapsed = max(time.time() - self._start, 1e-6)
+        suffix = f" {extra}" if extra else ""
+        self._emit(f"finish completed={self.total}/{self.total} pct=100% elapsed_s={elapsed:.1f}{suffix}")
 
 
 def _nemotron_src_root() -> Path:
@@ -135,12 +179,15 @@ def run_nemotron_ocr_stage(
     text_nodes: list[dict[str, Any]] = []
     source_counts: dict[str, int] = {}
     per_image_box_counts: list[int] = []
+    progress = _StageProgressLogger("nemotron_ocr", len(image_specs))
+    progress.start()
 
     image_dims: dict[str, tuple[int, int]] = {}
     for spec in image_specs:
         with Image.open(_resolve_image_path(spec["image_path"])).convert("RGB") as image:
             image_dims[spec["image_id"]] = (int(image.width), int(image.height))
 
+    processed_images = 0
     for batch_specs in _chunked(image_specs, detector_batch_size):
         batch_paths = [str(_resolve_image_path(spec["image_path"])) for spec in batch_specs]
         batch_predictions = ocr(batch_paths, merge_level=merge_level, include_invalid=include_invalid)
@@ -229,6 +276,11 @@ def run_nemotron_ocr_stage(
                 )
             detections_by_image[spec["image_id"]] = rows_for_image
             per_image_box_counts.append(len(rows_for_image))
+            processed_images += 1
+            progress.tick(
+                processed_images,
+                extra=f"image_id={spec['image_id']} detections={len(rows_for_image)} total_text_nodes={len(text_nodes)}",
+            )
 
     detection_summary = {
         "images": len(image_specs),
@@ -255,4 +307,5 @@ def run_nemotron_ocr_stage(
         "frontend": "nemotron_v2",
         "clarity_confidence_floor": clarity_floor,
     }
+    progress.finish(extra=f"detections={len(detection_rows)} text_nodes={len(text_nodes)}")
     return detections_by_image, detection_rows, detection_summary, text_nodes, consensus_stats

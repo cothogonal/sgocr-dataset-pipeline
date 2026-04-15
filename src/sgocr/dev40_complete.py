@@ -4,6 +4,7 @@ import json
 import math
 import re
 import statistics
+import time
 import unicodedata
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -34,6 +35,7 @@ from .bootstrap_kd import (
     overlap_fraction,
 )
 from .gemini_batch import GeminiBatchRequest, batch_generate_json, image_part_from_payload
+from .semantic_grounding import extract_anchor_color
 from .semantic_dev40_tuning import load_semantic_dev40_tuning
 from .secrets import GEMINI, get_secret
 from .teacher.http_clients import encode_image
@@ -471,6 +473,7 @@ def grounding_context_from_tuple(tuple_row: dict[str, Any]) -> dict[str, Any]:
     return {
         "query_anchor_label": str(tuple_row["anchor_label"]),
         "query_anchor_synonyms": list(tuple_row.get("anchor_synonyms") or [tuple_row["anchor_label"]]),
+        "query_anchor_color": str(tuple_row.get("anchor_color") or extract_anchor_color(str(tuple_row.get("anchor_label") or "")) or ""),
         "query_anchor_box": list(tuple_row["anchor_box"]),
         "query_anchor_local_phrase": anchor_local_phrase_for_tuple(tuple_row),
         "query_anchor_local_synonyms": anchor_local_synonyms_for_tuple(tuple_row),
@@ -479,6 +482,7 @@ def grounding_context_from_tuple(tuple_row: dict[str, Any]) -> dict[str, Any]:
         "query_specific_location_phrase": specific_location_phrase_for_tuple(tuple_row),
         "query_specific_location_synonyms": specific_location_synonyms_for_tuple(tuple_row),
         "query_relation": str(tuple_row.get("relation") or ""),
+        "query_anchor_disambiguation_required": bool(int((tuple_row.get("kd_metadata") or {}).get("anchor_label_competitors") or 0) >= 1),
     }
 
 
@@ -546,12 +550,16 @@ def candidate_location_synonyms(candidate: dict[str, Any]) -> list[str]:
 
 
 def candidate_anchor_local_phrase(candidate: dict[str, Any]) -> str:
+    if not _anchor_local_phrase_allowed(candidate):
+        return ""
     if candidate.get("query_anchor_local_phrase"):
         return str(candidate["query_anchor_local_phrase"])
     return anchor_local_phrase_for_tuple(candidate["tuple"])
 
 
 def candidate_anchor_local_synonyms(candidate: dict[str, Any]) -> list[str]:
+    if not _anchor_local_phrase_allowed(candidate):
+        return []
     if candidate.get("query_anchor_local_synonyms"):
         return list(candidate["query_anchor_local_synonyms"])
     return anchor_local_synonyms_for_tuple(candidate["tuple"])
@@ -569,6 +577,321 @@ def candidate_specific_location_synonyms(candidate: dict[str, Any]) -> list[str]
     return specific_location_synonyms_for_tuple(candidate["tuple"])
 
 
+def candidate_anchor_color(candidate: dict[str, Any]) -> str:
+    tuning = load_semantic_dev40_tuning()
+    if not tuning.anchor_reference_color_enabled:
+        return ""
+    explicit = str(candidate.get("query_anchor_color") or candidate["tuple"].get("anchor_color") or "").strip()
+    if explicit:
+        return explicit
+    return str(extract_anchor_color(candidate_anchor_label(candidate)) or "")
+
+
+def candidate_anchor_label_competitors(candidate: dict[str, Any]) -> int:
+    return int((candidate["tuple"].get("kd_metadata") or {}).get("anchor_label_competitors") or 0)
+
+
+_IRREGULAR_ANCHOR_PLURALS = {
+    "person": "people",
+    "man": "men",
+    "woman": "women",
+    "child": "children",
+    "foot": "feet",
+    "tooth": "teeth",
+    "mouse": "mice",
+}
+
+
+def _pluralize_word(word: str) -> str:
+    raw = str(word or "").strip()
+    if not raw:
+        return ""
+    lowered = raw.lower()
+    if lowered in _IRREGULAR_ANCHOR_PLURALS:
+        plural = _IRREGULAR_ANCHOR_PLURALS[lowered]
+        return plural if raw.islower() else plural.title() if raw.istitle() else plural.upper() if raw.isupper() else plural
+    if lowered.endswith("y") and len(lowered) >= 2 and lowered[-2] not in "aeiou":
+        return raw[:-1] + "ies"
+    if lowered.endswith(("s", "x", "z", "ch", "sh")):
+        return raw + "es"
+    return raw + "s"
+
+
+def pluralize_anchor_phrase(text: str) -> str:
+    parts = [part for part in str(text or "").strip().split() if part]
+    if not parts:
+        return ""
+    parts[-1] = _pluralize_word(parts[-1])
+    return " ".join(parts)
+
+
+def repeated_anchor_group_context(tuple_row: dict[str, Any]) -> dict[str, Any] | None:
+    tuning = load_semantic_dev40_tuning()
+    if not tuning.repeated_anchor_grouping_enabled:
+        return None
+    kd = tuple_row.get("kd_metadata") or {}
+    group_instances = int(kd.get("same_anchor_same_answer_nonoverlap_instances") or 0)
+    if group_instances < int(tuning.repeated_anchor_group_min_instances):
+        return None
+    anchor_label = str(tuple_row.get("anchor_label") or "").strip()
+    if not anchor_label:
+        return None
+    base_synonyms = list(tuple_row.get("anchor_synonyms") or [anchor_label])
+    plural_synonyms: list[str] = []
+    for phrase in base_synonyms:
+        plural = pluralize_anchor_phrase(phrase)
+        if plural:
+            plural_synonyms.append(plural)
+            plural_synonyms.append(f"the {plural}")
+            plural_synonyms.append(f"all the {plural}")
+    plural_synonyms = list(dict.fromkeys(item.strip() for item in plural_synonyms if item.strip()))
+    if not plural_synonyms:
+        return None
+    return {
+        "query_group_mode": "scene_repeat_same_text",
+        "query_group_count": group_instances,
+        "query_anchor_label": plural_synonyms[0],
+        "query_anchor_synonyms": plural_synonyms,
+        "query_anchor_local_phrase": "",
+        "query_anchor_local_synonyms": [],
+        "query_location_phrase": "",
+        "query_location_synonyms": [],
+        "query_specific_location_phrase": "",
+        "query_specific_location_synonyms": [],
+        "query_anchor_disambiguation_required": False,
+        "query_location_required": False,
+    }
+
+
+def candidate_scene_repeat_group_mode(candidate: dict[str, Any]) -> str:
+    return str(candidate.get("query_group_mode") or "")
+
+
+def _anchor_local_phrase_allowed(candidate: dict[str, Any]) -> bool:
+    phrase = str(candidate.get("query_anchor_local_phrase") or candidate["tuple"].get("anchor_local_phrase") or "").strip()
+    if not phrase:
+        return False
+    if candidate_scene_repeat_group_mode(candidate):
+        return False
+    tuning = load_semantic_dev40_tuning()
+    if not tuning.suppress_anchor_local_without_competing_text:
+        return True
+    kd = candidate["tuple"].get("kd_metadata") or {}
+    same_anchor_text_count = int(kd.get("same_anchor_text_count") or (int(kd.get("anchor_overlap_competitors") or 0) + 1))
+    return same_anchor_text_count >= 2
+
+
+def candidate_requires_anchor_disambiguation(candidate: dict[str, Any]) -> bool:
+    tuning = load_semantic_dev40_tuning()
+    if not tuning.sibling_disambiguation_enabled:
+        return False
+    if candidate_scene_repeat_group_mode(candidate):
+        return False
+    if candidate.get("query_anchor_disambiguation_required") is not None:
+        return bool(candidate.get("query_anchor_disambiguation_required"))
+    kd = candidate["tuple"].get("kd_metadata") or {}
+    return bool(
+        int(kd.get("anchor_label_competitors") or 0) >= 1
+        or int(kd.get("anchor_cluster_size") or 1) >= 2
+    )
+
+
+def _minimal_location_phrase(text: str) -> str:
+    raw = str(text or "").strip()
+    if not raw:
+        return ""
+    replacements = {
+        "upper-left area of the image": "upper left of the image",
+        "upper-right area of the image": "upper right of the image",
+        "lower-left area of the image": "lower left of the image",
+        "lower-right area of the image": "lower right of the image",
+        "top-center area of the image": "top center of the image",
+        "bottom-center area of the image": "bottom center of the image",
+        "center-left area of the image": "left side of the image",
+        "center-right area of the image": "right side of the image",
+        "center area of the image": "center of the image",
+    }
+    normalized = raw.lower()
+    if normalized in replacements:
+        return replacements[normalized]
+    compact = raw.replace(" area of the image", " of the image")
+    compact = compact.replace(" part of the image", " of the image")
+    compact = re.sub(r"\bupper-left\b", "upper left", compact, flags=re.IGNORECASE)
+    compact = re.sub(r"\bupper-right\b", "upper right", compact, flags=re.IGNORECASE)
+    compact = re.sub(r"\blower-left\b", "lower left", compact, flags=re.IGNORECASE)
+    compact = re.sub(r"\blower-right\b", "lower right", compact, flags=re.IGNORECASE)
+    compact = re.sub(r"\s+", " ", compact).strip()
+    return compact
+
+
+def candidate_minimal_location_synonyms(candidate: dict[str, Any]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for item in candidate_location_synonyms(candidate):
+        text = _minimal_location_phrase(item)
+        norm = normalize_answer(text)
+        if not norm or norm in seen:
+            continue
+        seen.add(norm)
+        out.append(text)
+    return out
+
+
+def candidate_minimal_specific_location_synonyms(candidate: dict[str, Any]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for item in candidate_specific_location_synonyms(candidate):
+        text = _minimal_location_phrase(item)
+        norm = normalize_answer(text)
+        if not norm or norm in seen:
+            continue
+        seen.add(norm)
+        out.append(text)
+    return out
+
+
+def candidate_disambiguation_cues(candidate: dict[str, Any]) -> list[str]:
+    tuning = load_semantic_dev40_tuning()
+    cues: list[str] = []
+    color = candidate_anchor_color(candidate)
+    label = candidate_anchor_label(candidate)
+    if tuning.anchor_reference_color_enabled and color and label and normalize_answer(color) not in normalize_answer(label):
+        cues.append(f"{color} {label}")
+    elif tuning.anchor_reference_color_enabled and color:
+        cues.append(color)
+    for item in candidate_anchor_local_synonyms(candidate):
+        if item:
+            cues.append(item)
+    for item in candidate_minimal_specific_location_synonyms(candidate):
+        if item:
+            cues.append(item)
+    for item in candidate_anchor_region_synonyms(candidate):
+        if item:
+            cues.append(item)
+    for item in candidate_minimal_location_synonyms(candidate):
+        if item:
+            cues.append(item)
+    seen: set[str] = set()
+    out: list[str] = []
+    for item in cues:
+        norm = normalize_answer(item)
+        if not norm or norm in seen:
+            continue
+        seen.add(norm)
+        out.append(item)
+    return out
+
+
+def candidate_cheap_ambiguity_proxy_score(candidate: dict[str, Any]) -> int:
+    tuple_row = candidate["tuple"]
+    kd = tuple_row.get("kd_metadata") or {}
+    same_label_competitors = int(kd.get("anchor_label_competitors") or 0)
+    same_anchor_text_count = int(kd.get("same_anchor_text_count") or (int(kd.get("anchor_overlap_competitors") or 0) + 1))
+    same_answer_instances = int(kd.get("same_anchor_same_answer_nonoverlap_instances") or 1)
+    distinct_answers = int(kd.get("same_anchor_distinct_answer_count") or 1)
+    coarse_competitors = int(kd.get("coarse_region_competitors") or 0)
+    bucket_competitors = int(kd.get("bucket_competitors") or 0)
+    overlap_competitors = int(kd.get("anchor_overlap_competitors") or 0)
+    competing = int(kd.get("competing_tuples") or 0)
+    score = 0
+    if same_label_competitors >= 6 and overlap_competitors <= 1:
+        score += 3
+    elif same_label_competitors >= 3 and overlap_competitors <= 1:
+        score += 2
+    elif same_label_competitors >= 1 and overlap_competitors <= 1:
+        score += 1
+    if same_anchor_text_count >= 3:
+        score += 2
+    elif same_anchor_text_count >= 2:
+        score += 1
+    if same_answer_instances >= 4:
+        score += 2
+    elif same_answer_instances >= 3:
+        score += 1
+    if distinct_answers >= 5:
+        score += 2
+    elif distinct_answers >= 3:
+        score += 1
+    if coarse_competitors >= 1:
+        score += 1
+    if bucket_competitors >= 1:
+        score += 1
+    if competing >= 2:
+        score += 1
+    if candidate_scene_repeat_group_mode(candidate):
+        score = max(score - 2, 0)
+    return score
+
+
+_SIMPLE_COLORS = frozenset({
+    "red", "blue", "green", "brown", "white", "black", "gray", "grey",
+    "yellow", "orange", "purple", "pink", "silver", "gold",
+})
+
+# Shape tokens that, when present in an anchor_label, make anchor_shape ANCHOR_PROPERTY
+# questions circular (the answer is derivable from the label itself).
+_ANCHOR_SHAPE_TOKENS: frozenset[str] = frozenset({
+    "rectangular", "circular", "square", "oval", "round",
+    "triangular", "hexagonal", "cylindrical", "spherical",
+})
+
+# Structural-fallback label pattern: color + shape combined. These labels are generated
+# by the structural fallback prompt for chart/diagram images and make REVERSE_GROUND
+# questions text-leaky (the anchor description encodes enough visual info that a text
+# model can infer spatial position from prior knowledge of chart conventions).
+_STRUCTURAL_SHAPE_TOKENS: frozenset[str] = frozenset({
+    "rectangular", "circular", "square", "oval", "wedge",
+    "segment", "panel", "emblem", "badge", "bar",
+})
+
+
+def _anchor_label_has_circular_shape(anchor_label: str) -> bool:
+    """Return True if the anchor label contains a shape token that would make
+    anchor_shape ANCHOR_PROPERTY circular (answer is already in the label)."""
+    tokens = set(normalize_answer(anchor_label).split())
+    return bool(tokens & _ANCHOR_SHAPE_TOKENS)
+
+
+def _anchor_label_is_structural_fallback(anchor_label: str) -> bool:
+    """Return True if the anchor label looks like a structural-fallback generated description.
+
+    Structural fallback labels combine a color with a structural shape type
+    (e.g. 'blue rectangular bar', 'orange wedge segment'). These make REVERSE_GROUND
+    questions text-leaky because the color+shape description encodes visual context
+    that text-only models can exploit via chart-knowledge priors.
+    """
+    tokens = set(normalize_answer(anchor_label).split())
+    return bool(tokens & _SIMPLE_COLORS) and bool(tokens & _STRUCTURAL_SHAPE_TOKENS)
+
+
+def candidate_has_answer_leakage(candidate: dict[str, Any], question: str) -> bool:
+    """Return True when the expected answer is trivially derivable from the question text alone.
+
+    Two cases:
+    - TEXT_PROPERTY word_count: the full text blob is quoted in the question, so the model can
+      count the words without looking at the image.
+    - ANCHOR_PROPERTY anchor_color: the expected color word appears verbatim in the anchor label
+      embedded in the question (e.g. "What color is the *brown* bottle?" → "brown" is leaked).
+    """
+    qtype = candidate.get("question_type", "")
+    norm_q = normalize_answer(question)
+    if qtype == "TEXT_PROPERTY" and str(candidate.get("text_property_type") or "") == "word_count":
+        tuple_row = candidate["tuple"]
+        text_blob = normalize_answer(str(tuple_row.get("answer") or ""))
+        if text_blob and text_blob in norm_q:
+            expected = str(candidate.get("expected_answer") or "").strip()
+            derived = str(len(str(tuple_row.get("answer") or "").split()))
+            if expected == derived:
+                return True
+    if qtype == "ANCHOR_PROPERTY" and str(candidate.get("anchor_property_type") or "anchor_color") == "anchor_color":
+        expected_tokens = set(normalize_answer(str(candidate.get("expected_answer") or "")).split())
+        anchor_tokens = set(normalize_answer(candidate_anchor_label(candidate)).split())
+        color_hits = expected_tokens & _SIMPLE_COLORS & anchor_tokens
+        if color_hits:
+            return True
+    return False
+
+
 def stable_choice(options: list[str], seed_text: str) -> str:
     if not options:
         return ""
@@ -577,10 +900,19 @@ def stable_choice(options: list[str], seed_text: str) -> str:
 
 
 def preferred_location_phrase_for_candidate(candidate: dict[str, Any]) -> str:
+    tuning = load_semantic_dev40_tuning()
     if candidate.get("query_location_required") and candidate_specific_location_synonyms(candidate):
-        options = candidate_specific_location_synonyms(candidate)
+        options = (
+            candidate_minimal_specific_location_synonyms(candidate)
+            if tuning.location_wording_mode == "finalv0"
+            else candidate_specific_location_synonyms(candidate)
+        )
     else:
-        options = candidate_location_synonyms(candidate)
+        options = (
+            candidate_minimal_location_synonyms(candidate)
+            if tuning.location_wording_mode == "finalv0"
+            else candidate_location_synonyms(candidate)
+        )
     return stable_choice(options, str(candidate["candidate_id"]))
 
 
@@ -671,10 +1003,25 @@ def ambiguity_level_from_score(score: int) -> str:
     return "high"
 
 
+def _anchor_centroid_offset(tuple_row: dict[str, Any]) -> float:
+    """Fractional displacement of the anchor centroid from image center (0=center, 0.5=corner)."""
+    box = tuple_row.get("anchor_box")
+    if not isinstance(box, list) or len(box) < 4:
+        return 0.5
+    w = float(tuple_row.get("image_width") or 1)
+    h = float(tuple_row.get("image_height") or 1)
+    cx = (float(box[0]) + float(box[2])) / 2.0
+    cy = (float(box[1]) + float(box[3])) / 2.0
+    return max(abs(cx / w - 0.5), abs(cy / h - 0.5))
+
+
 def requires_specific_location(tuple_row: dict[str, Any], question_type: str, *, yesno_polarity: str | None = None) -> bool:
     tuning = load_semantic_dev40_tuning()
     if not specific_location_synonyms_for_tuple(tuple_row):
         return False
+    if tuning.spatial_min_centroid_offset > 0.0:
+        if _anchor_centroid_offset(tuple_row) < tuning.spatial_min_centroid_offset:
+            return False
     score = location_ambiguity_score(tuple_row)
     competing = int((tuple_row.get("kd_metadata") or {}).get("competing_tuples") or 0)
     if question_type == "YES_NO" and yesno_polarity == "negative":
@@ -724,12 +1071,18 @@ def _normalize_yesno_query_text(text: str) -> str:
     return str(text).rstrip("][(.,;:!?)'\"").strip()
 
 
-def build_question_candidates(tuple_row: dict[str, Any], answer_units: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def build_question_candidates(tuple_row: dict[str, Any], answer_units: list[dict[str, Any]], tuning=None) -> list[dict[str, Any]]:
+    if tuning is None:
+        tuning = load_semantic_dev40_tuning()
     candidates: list[dict[str, Any]] = []
     base_quality = candidate_quality(tuple_row)
     actual_grounding = grounding_context_from_tuple(tuple_row)
+    repeated_group_context = repeated_anchor_group_context(tuple_row)
+    direct_read_grounding = dict(repeated_group_context or actual_grounding)
+    yesno_positive_grounding = dict(repeated_group_context or actual_grounding)
+    grouped_scene_read = bool(repeated_group_context)
     reference_text = property_reference_text(tuple_row)
-    needs_specific_read_location = requires_specific_location(tuple_row, "DIRECT_READ")
+    needs_specific_read_location = False if grouped_scene_read else requires_specific_location(tuple_row, "DIRECT_READ")
     needs_specific_property_location = requires_specific_location(tuple_row, "TEXT_PROPERTY")
     needs_specific_anchor_property_location = requires_specific_location(tuple_row, "ANCHOR_PROPERTY")
 
@@ -738,7 +1091,7 @@ def build_question_candidates(tuple_row: dict[str, Any], answer_units: list[dict
             "candidate_id": f"{tuple_row['tuple_id']}::DIRECT_READ",
             "tuple": tuple_row,
             "question_type": "DIRECT_READ",
-            "quality": base_quality + 0.35,
+            "quality": base_quality + (0.40 if grouped_scene_read else 0.35),
             "answer_source": "mechanical",
             "answer_type": "text_string",
             "expected_answer": tuple_row["answer"],
@@ -747,7 +1100,7 @@ def build_question_candidates(tuple_row: dict[str, Any], answer_units: list[dict
             "yesno_distractor_source": None,
             "text_property_type": None,
             "anchor_property_type": None,
-            **actual_grounding,
+            **direct_read_grounding,
             "query_location_required": needs_specific_read_location,
         }
     )
@@ -766,12 +1119,12 @@ def build_question_candidates(tuple_row: dict[str, Any], answer_units: list[dict
             "yesno_distractor_source": None,
             "text_property_type": None,
             "anchor_property_type": None,
-            **actual_grounding,
-            "query_location_required": requires_specific_location(tuple_row, "YES_NO", yesno_polarity="positive"),
+            **yesno_positive_grounding,
+            "query_location_required": False if grouped_scene_read else requires_specific_location(tuple_row, "YES_NO", yesno_polarity="positive"),
         }
     )
 
-    exclusion = choose_grounded_exclusion(tuple_row, answer_units)
+    exclusion = None if grouped_scene_read else choose_grounded_exclusion(tuple_row, answer_units)
     if exclusion is not None:
         candidates.append(
             {
@@ -789,6 +1142,7 @@ def build_question_candidates(tuple_row: dict[str, Any], answer_units: list[dict
                 "anchor_property_type": None,
                 "query_anchor_label": exclusion["anchor_label"],
                 "query_anchor_synonyms": list(exclusion["anchor_synonyms"]),
+                "query_anchor_color": str(exclusion.get("anchor_color") or extract_anchor_color(str(exclusion["anchor_label"])) or ""),
                 "query_anchor_box": list(exclusion["anchor_box"]),
                 "query_anchor_local_phrase": str(exclusion.get("anchor_local_phrase") or ""),
                 "query_anchor_local_synonyms": list(exclusion.get("anchor_local_synonyms") or []),
@@ -797,13 +1151,18 @@ def build_question_candidates(tuple_row: dict[str, Any], answer_units: list[dict
                 "query_specific_location_phrase": str(exclusion.get("specific_location_phrase") or exclusion["location_phrase"]),
                 "query_specific_location_synonyms": list(exclusion.get("specific_location_synonyms") or exclusion["location_synonyms"]),
                 "query_relation": str(exclusion["relation"]),
+                "query_anchor_disambiguation_required": bool(int((exclusion.get("kd_metadata") or {}).get("anchor_label_competitors") or 0) >= 1),
                 "query_location_required": requires_specific_location(exclusion, "YES_NO", yesno_polarity="negative"),
                 "grounded_exclusion_score": round(float(exclusion["strength"]), 4),
                 "grounded_exclusion_source_tuple_id": str(exclusion["tuple_id"]),
             }
         )
 
-    if tuple_row["unique"]:
+    _rg_structural_blocked = (
+        tuning.rg_structural_anchor_filter_enabled
+        and _anchor_label_is_structural_fallback(str(tuple_row.get("anchor_label") or ""))
+    )
+    if tuple_row["unique"] and not grouped_scene_read and not _rg_structural_blocked:
         candidates.append(
             {
                 "candidate_id": f"{tuple_row['tuple_id']}::REVERSE_GROUND",
@@ -903,17 +1262,31 @@ def build_question_candidates(tuple_row: dict[str, Any], answer_units: list[dict
         )
     if tuple_row["relation"] == "on" and float(tuple_row.get("anchor_score") or 0.0) >= 0.60:
         object_bonus = 0.08 if str(tuple_row.get("anchor_category") or "") in {"container", "device", "clothing", "vehicle"} else 0.02
+        _anchor_color_mech = None
+        if tuning.anchor_color_mechanical_answer_enabled:
+            _raw_color = extract_anchor_color(str(tuple_row.get("anchor_label") or ""))
+            if _raw_color and normalize_answer(_raw_color) in _SIMPLE_COLORS:
+                _anchor_color_mech = _raw_color
+        _label_has_circular_shape = _anchor_label_has_circular_shape(
+            str(tuple_row.get("anchor_label") or "")
+        )
         for rank, property_type in enumerate(ordered_anchor_property_types(tuple_row)):
+            # Skip anchor_shape when the label already contains a shape token — asking
+            # "What is the shape of the blue rectangular bar?" is circular: the answer
+            # "rectangular" is trivially derivable from the question text without the image.
+            if property_type == "anchor_shape" and _label_has_circular_shape:
+                continue
             quality_bonus = object_bonus + (0.09, 0.07, 0.045)[rank]
+            _use_mechanical_color = property_type == "anchor_color" and _anchor_color_mech is not None
             candidates.append(
                 {
                     "candidate_id": f"{tuple_row['tuple_id']}::ANCHOR_PROPERTY::{property_type.upper()}",
                     "tuple": tuple_row,
                     "question_type": "ANCHOR_PROPERTY",
                     "quality": base_quality + quality_bonus,
-                    "answer_source": "teacher_visual",
+                    "answer_source": "mechanical_color" if _use_mechanical_color else "teacher_visual",
                     "answer_type": "attribute",
-                    "expected_answer": None,
+                    "expected_answer": _anchor_color_mech if _use_mechanical_color else None,
                     "queried_text": reference_text,
                     "query_text_reference": reference_text,
                     "yesno_polarity": None,
@@ -1019,6 +1392,15 @@ def candidate_quality(tuple_row: dict[str, Any]) -> float:
 
 
 def select_candidates(candidates: list[dict[str, Any]], *, target_count: int) -> list[dict[str, Any]]:
+    tuning = load_semantic_dev40_tuning()
+    # Upstream centroid filter: remove candidates whose anchor is too close to image center.
+    # When enabled, this prevents near-center anchors from ever reaching Gemini generation,
+    # rather than merely suppressing their location phrasing post-hoc.
+    if tuning.upstream_centroid_filter_enabled and tuning.spatial_min_centroid_offset > 0.0:
+        candidates = [
+            c for c in candidates
+            if _anchor_centroid_offset(c["tuple"]) >= tuning.spatial_min_centroid_offset
+        ]
     if len(candidates) <= target_count:
         return sorted(candidates, key=lambda item: (-float(item["quality"]), item["candidate_id"]))
 
@@ -1027,7 +1409,6 @@ def select_candidates(candidates: list[dict[str, Any]], *, target_count: int) ->
     used_qtypes: Counter[str] = Counter()
     used_anchor_labels: Counter[str] = Counter()
     remaining = sorted(candidates, key=lambda row: (-float(row["quality"]), row["candidate_id"]))
-    tuning = load_semantic_dev40_tuning()
     while remaining and len(selected) < target_count:
         best = None
         best_score = -1e9
@@ -1039,8 +1420,14 @@ def select_candidates(candidates: list[dict[str, Any]], *, target_count: int) ->
             score += 1.1 if used_qtypes[candidate["question_type"]] == 0 else 0.0
             if candidate["question_type"] == "DIRECT_READ":
                 score += 0.25
+            if tuning.per_image_anchor_diversity_bonus > 0.0 and anchor_label_norm and used_anchor_labels[anchor_label_norm] == 0:
+                score += tuning.per_image_anchor_diversity_bonus
             if candidate["question_type"] == "YES_NO" and candidate.get("yesno_polarity") == "negative":
                 score += 0.08 + float(candidate.get("grounded_exclusion_score") or 0.0) * 0.025
+            if tuning.rg_candidate_oversample_boost > 0.0 and candidate["question_type"] == "REVERSE_GROUND":
+                score += float(tuning.rg_candidate_oversample_boost)
+            if tuning.property_candidate_selection_bonus > 0.0 and candidate["question_type"] in {"TEXT_PROPERTY", "ANCHOR_PROPERTY"}:
+                score += float(tuning.property_candidate_selection_bonus)
             if (
                 tuning.anchor_type_soft_cap_count > 0
                 and anchor_label_norm
@@ -1091,8 +1478,10 @@ def enforce_type_constraints(selected: list[dict[str, Any]], candidates: list[di
                 selected.remove(min(removable, key=lambda candidate: float(candidate["quality"])))
         selected.append(pick)
 
+    rg_cap = max(1, int(tuning.rg_per_image_hard_cap))
     for limited_type in ("REVERSE_GROUND", "TEXT_PROPERTY", "ANCHOR_PROPERTY"):
-        while sum(1 for item in selected if item["question_type"] == limited_type) > 1:
+        cap = rg_cap if limited_type == "REVERSE_GROUND" else 1
+        while sum(1 for item in selected if item["question_type"] == limited_type) > cap:
             items = [item for item in selected if item["question_type"] == limited_type]
             selected.remove(min(items, key=lambda item: float(item["quality"])))
 
@@ -1151,6 +1540,14 @@ def run_teacher_batches(
                 if item is None and position - 1 < len(items):
                     item = items[position - 1]
                 normalized_rows.append(normalize_candidate_result(candidate, item, result))
+            annotate_answer_probe_rows(
+                model=model,
+                image_payload=payload,
+                indexed_candidates=indexed_candidates,
+                normalized_rows=normalized_rows,
+                tuning=tuning,
+            )
+            apply_answer_probe_policy(normalized_rows, tuning=tuning)
             batch_row = {
                 "image_id": batch["image_id"],
                 "image_path": image_path,
@@ -1302,6 +1699,15 @@ def _run_teacher_batches_via_gemini_batch(
             if item is None and position - 1 < len(items):
                 item = items[position - 1]
             normalized_rows.append(normalize_candidate_result(candidate, item, result))
+        payload = encode_image(Path(batch["image_path"]), max_side=max_side)
+        annotate_answer_probe_rows(
+            model=model,
+            image_payload=payload,
+            indexed_candidates=indexed_candidates,
+            normalized_rows=normalized_rows,
+            tuning=tuning,
+        )
+        apply_answer_probe_policy(normalized_rows, tuning=tuning)
         batch_rows.append(
             {
                 "image_id": batch["image_id"],
@@ -1589,6 +1995,45 @@ def _annotate_inline_frontier_via_gemini_batch(
     }
 
 
+def _gemini_post_with_http_retry(
+    url: str,
+    headers: dict[str, str],
+    body: dict[str, Any],
+    *,
+    timeout_s: int = 120,
+    max_http_attempts: int = 4,
+) -> "requests.Response":
+    """POST to the Gemini API with exponential backoff on transient HTTP errors.
+
+    Retries on 429 (rate limit) and 5xx (server errors). Waits 2**attempt seconds
+    before each retry (1s, 2s, 4s for attempts 1-3). Raises immediately on 4xx
+    client errors other than 429.
+    """
+    last_exc: Exception | None = None
+    for attempt in range(max_http_attempts):
+        try:
+            response = requests.post(url, headers=headers, json=body, timeout=timeout_s)
+            if response.status_code == 429 or response.status_code >= 500:
+                if attempt < max_http_attempts - 1:
+                    time.sleep(2.0 ** attempt)
+                    last_exc = requests.exceptions.HTTPError(
+                        f"HTTP {response.status_code}", response=response
+                    )
+                    continue
+                response.raise_for_status()
+            response.raise_for_status()
+            return response
+        except requests.exceptions.Timeout as exc:
+            if attempt < max_http_attempts - 1:
+                time.sleep(2.0 ** attempt)
+                last_exc = exc
+                continue
+            raise
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError("Gemini POST failed after all retry attempts")
+
+
 def call_gemini_inline_frontier_batched(*, model: str, image_payload: Any, rows: list[dict[str, Any]], timeout_s: int = 120) -> dict[str, Any]:
     last_error: Exception | None = None
     candidate_count = len(rows)
@@ -1613,16 +2058,15 @@ def call_gemini_inline_frontier_batched(*, model: str, image_payload: Any, rows:
                 "responseJsonSchema": inline_frontier_response_schema(candidate_count),
             },
         }
-        response = requests.post(
+        response = _gemini_post_with_http_retry(
             f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
             headers={
                 "x-goog-api-key": get_secret(GEMINI),
                 "Content-Type": "application/json",
             },
-            json=body,
-            timeout=timeout_s,
+            body=body,
+            timeout_s=timeout_s,
         )
-        response.raise_for_status()
         payload = response.json()
         raw_text = extract_gemini_text(payload)
         try:
@@ -1839,13 +2283,26 @@ def build_batched_prompt(selected_candidates: list[dict[str, Any]]) -> str:
         preferred_location_phrase = preferred_location_phrase_for_candidate(candidate)
         specific_location_phrase = candidate_specific_location_phrase(candidate)
         anchor_region_phrase = candidate_anchor_region_phrase(candidate)
+        anchor_color = candidate_anchor_color(candidate)
+        disambiguation_cues = candidate_disambiguation_cues(candidate)
+        same_anchor_competitors = candidate_anchor_label_competitors(candidate)
+        anchor_disambiguation_required = candidate_requires_anchor_disambiguation(candidate)
+        group_mode = candidate_scene_repeat_group_mode(candidate)
+        cheap_proxy_score = candidate_cheap_ambiguity_proxy_score(candidate)
         lines = [
             f"--- Candidate {candidate['candidate_index']} ---",
             f"candidate_index: {candidate['candidate_index']}",
             f"question_type: {qtype}",
             f'text: "{tuple_row["answer"]}"',
             f'anchor_label: "{candidate_anchor_label(candidate)}"',
+            f'anchor_color: "{anchor_color}"',
+            f'group_mode: "{group_mode}"',
+            f"group_anchor_count: {int(candidate.get('query_group_count') or 0)}",
             f"allowed_anchor_phrases: {json.dumps(candidate_anchor_phrases(candidate), ensure_ascii=False)}",
+            f"anchor_disambiguation_required: {'yes' if anchor_disambiguation_required else 'no'}",
+            f"same_anchor_label_competitors: {same_anchor_competitors}",
+            f"cheap_ambiguity_proxy_score: {cheap_proxy_score}",
+            f"preferred_disambiguation_cues: {json.dumps(disambiguation_cues[:6], ensure_ascii=False)}",
             f'anchor_local_location: "{candidate_anchor_local_phrase(candidate)}"',
             f"allowed_anchor_local_phrases: {json.dumps(candidate_anchor_local_synonyms(candidate), ensure_ascii=False)}",
             f'anchor_region: "{anchor_region_phrase}"',
@@ -1863,6 +2320,9 @@ def build_batched_prompt(selected_candidates: list[dict[str, Any]]) -> str:
         ]
         if qtype == "DIRECT_READ":
             lines.append(f'Write 1 natural question asking what the text says at this location. The answer must be exactly "{tuple_row["answer"]}".')
+            if group_mode == "scene_repeat_same_text":
+                lines.append("This text appears on multiple matching anchors in the image. Ask about the repeated set as a whole instead of singling out one instance.")
+                lines.append("Use a plural anchor phrase such as one of the allowed anchor phrases. Do not use anchor-local or image-global location wording unless it is absolutely necessary.")
             if unique_skip_location:
                 lines.append("The target text is unique in this image. Do not mention any image-level location phrase; identify it using the anchor phrase only.")
             if tuning.location_wording_mode == "lite":
@@ -1872,18 +2332,31 @@ def build_batched_prompt(selected_candidates: list[dict[str, Any]]) -> str:
             elif tuning.location_wording_mode == "rich_local":
                 lines.append("Use one clean local spatial phrase tied to the anchor, such as upper left, lower right, above, below, left side, right side, center, top edge, or bottom edge, when that phrasing is visibly warranted.")
                 lines.append("Prefer anchor-relative wording over broad image-global wording. Use at most one coarse image phrase if it is truly needed for disambiguation.")
+            elif tuning.location_wording_mode == "finalv0":
+                lines.append("Use minimal localization first. Prefer a short anchor phrase alone when it is unique, or add exactly one extra cue such as color, anchor-local position, or one coarse image phrase when needed.")
+                lines.append("Avoid duplicated tiers such as `upper-left text in the upper-left area of the image`. If you need two tiers, make them different, such as anchor-local plus global, or color plus anchor-local.")
+                lines.append("Vary the wording naturally across examples: rotate between `left side of`, `upper part of`, `near the lower edge of`, `on the right side of`, or `in the upper right of the image` when visually warranted.")
             else:
                 lines.append("Use a small amount of spatial wording variation when possible, but keep the question literal and brief.")
+            if anchor_disambiguation_required:
+                lines.append("This anchor type appears multiple times in the image. Use the anchor phrase plus one additional disambiguation cue. Prefer color first, then a local anchor phrase, then one coarse image phrase.")
             if candidate.get("query_location_required") and not unique_skip_location:
                 lines.append(f'Because nearby text boxes share this region, make the question more specific by mentioning both an allowed anchor phrase and the preferred specific location phrase "{preferred_location_phrase}".')
                 lines.append("Do not stack multiple near-synonymous global phrases together; use one clean specific phrase instead of layered wording.")
         elif qtype == "YES_NO":
             lines.append(f'Write 1 yes/no question asking whether the text at this location says "{candidate["queried_text"]}".')
             lines.append(f'The answer must be exactly "{candidate["expected_answer"]}".')
+            if group_mode == "scene_repeat_same_text":
+                lines.append("This text appears on multiple matching anchors. Ask about that repeated set as a group and use a plural anchor phrase.")
+                lines.append("Do not single out one instance with local position wording.")
             if unique_skip_location:
                 lines.append("The target text is unique in this image. Do not mention any image-level location phrase; identify it using the anchor phrase only.")
             if tuning.location_wording_mode == "rich_local":
                 lines.append("When location wording is useful, prefer one clean anchor-relative spatial phrase over a broad image-global phrase.")
+            elif tuning.location_wording_mode == "finalv0":
+                lines.append("Keep location wording minimal. Use the anchor phrase alone when possible; otherwise add one explicit disambiguation cue without repeating the same region wording twice.")
+            if anchor_disambiguation_required:
+                lines.append("The anchor type repeats in the image. Mention one additional disambiguation cue such as color, local anchor position, or a single global image phrase.")
             if candidate.get("yesno_polarity") == "negative":
                 lines.append("This is a grounded exclusion check: the queried location is intentionally false for this image. Ask whether the text appears at this provided location, not whether it appears anywhere else in the image.")
                 if not unique_skip_location:
@@ -1944,6 +2417,13 @@ def build_batched_prompt(selected_candidates: list[dict[str, Any]]) -> str:
                     lines.append(
                         "Good patterns: `on the red bus side`, `above the player helmet`, `on the left side of the storefront sign`."
                     )
+                if tuning.location_wording_mode == "finalv0":
+                    lines.append(
+                        "Prefer minimal answer phrases. Start with the anchor phrase alone if it is unique. If the anchor repeats, add exactly one stronger cue such as color or local anchor position, and only add a global phrase when that is still necessary."
+                    )
+                    lines.append(
+                        "Good multi-tier patterns: `on the red sign near the top right`, `on the left side of the blue bus`, `at the lower edge of the white poster`."
+                    )
                 if anchor_region_phrase or candidate_anchor_local_phrase(candidate):
                     lines.append(
                         "Preferred phrasing options (use one, not all): "
@@ -2000,12 +2480,19 @@ def build_batched_prompt(selected_candidates: list[dict[str, Any]]) -> str:
                 lines.append(f'Because nearby text boxes share this region, mention the preferred specific location phrase "{preferred_location_phrase}" so the property question targets the correct text.')
             if tuning.location_wording_mode == "rich_local":
                 lines.append("If a location phrase is needed, prefer a concise anchor-relative phrase over a broad image-global phrase.")
+            elif tuning.location_wording_mode == "finalv0":
+                lines.append("If a location phrase is needed, use a single minimal cue and avoid layered duplicate global phrasing.")
+            if anchor_disambiguation_required:
+                lines.append("This anchor repeats in the image. Use one additional disambiguation cue, preferably color or a local anchor phrase.")
         elif qtype == "ANCHOR_PROPERTY":
             property_type = str(candidate.get("anchor_property_type") or "anchor_color")
             reference_text = str(candidate.get("query_text_reference") or tuple_row["answer"])
             if property_type == "anchor_color":
                 lines.append(f'Write 1 question about the visible color of the {candidate_anchor_label(candidate)} that has "{reference_text}" on it.')
-                lines.append('The answer must be a short color phrase of 1 to 3 words, such as "green" or "dark blue".')
+                if candidate.get("answer_source") == "mechanical_color" and candidate.get("expected_answer"):
+                    lines.append(f'The answer must be exactly "{candidate["expected_answer"]}".')
+                else:
+                    lines.append('The answer must be a short color phrase of 1 to 3 words, such as "green" or "dark blue".')
             elif property_type == "anchor_material":
                 lines.append(f'Write 1 question about the visible material or surface type of the {candidate_anchor_label(candidate)} that has "{reference_text}" on it.')
                 lines.append('The answer must be a short material phrase of 1 to 4 words, such as "metal" or "painted wood".')
@@ -2015,6 +2502,8 @@ def build_batched_prompt(selected_candidates: list[dict[str, Any]]) -> str:
             if candidate.get("query_location_required"):
                 lines.append(f'Mention the preferred specific location phrase "{preferred_location_phrase}" so the question clearly targets the correct text region.')
             lines.append("Keep it OCR-adjacent: use the text as the reference for which object to describe, but ask about the object or surface itself.")
+            if anchor_disambiguation_required:
+                lines.append("The anchor repeats in the image. Use one added disambiguation cue, preferably color or a local anchor phrase.")
         blocks.append("\n".join(lines))
 
     location_instruction = (
@@ -2022,6 +2511,8 @@ def build_batched_prompt(selected_candidates: list[dict[str, Any]]) -> str:
         if tuning.location_wording_mode == "lite"
         else "Vary the location wording across candidates when possible instead of repeating the same phrase every time.\n"
         if tuning.location_wording_mode == "varied"
+        else "Use minimal localization first. Prefer concise anchor-relative phrases, and only add a global phrase when it resolves ambiguity. If two tiers are needed, make them non-redundant.\n"
+        if tuning.location_wording_mode == "finalv0"
         else "Use some location wording variation across candidates, but keep the phrasing stable and literal.\n"
     )
     strictness_instruction = "Prefer short literal questions and short literal answers over expressive phrasing.\n" if tuning.teacher_strictness == "very_strict" else ""
@@ -2042,6 +2533,7 @@ def build_batched_prompt(selected_candidates: list[dict[str, Any]]) -> str:
         + "For DIRECT_READ, YES_NO, and mechanical TEXT_PROPERTY questions, the answer must exactly match the required value.\n"
         + "For REVERSE_GROUND, the answer must be a short visible location phrase that uses only the provided anchor/location wording.\n"
         + "When an anchor-local phrase is provided, you may use it, but keep the answer short and literal.\n"
+        + "When `group_mode` is `scene_repeat_same_text`, ask about the repeated anchors as a group using plural anchor wording, not a single singled-out instance.\n"
         + "For visual TEXT_PROPERTY questions, the answer must be a short visible attribute phrase of 1 to 4 words and the question must stay about the text itself.\n"
         + "For ANCHOR_PROPERTY, the answer must be a short visible attribute phrase of 1 to 4 words and the question must use the text as the reference for which object or surface to describe.\n"
         + "Return one JSON item per candidate in the same order.\n\n"
@@ -2073,6 +2565,208 @@ def batched_response_schema(candidate_count: int) -> dict[str, Any]:
         "required": ["items"],
         "additionalProperties": False,
     }
+
+
+def answer_probe_response_schema(candidate_count: int, probe_count: int) -> dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {
+            "items": {
+                "type": "array",
+                "minItems": candidate_count,
+                "maxItems": candidate_count,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "candidate_index": {"type": "integer"},
+                        "answers": {
+                            "type": "array",
+                            "minItems": probe_count,
+                            "maxItems": probe_count,
+                            "items": {"type": "string"},
+                        },
+                    },
+                    "required": ["candidate_index", "answers"],
+                    "additionalProperties": False,
+                },
+            }
+        },
+        "required": ["items"],
+        "additionalProperties": False,
+    }
+
+
+def build_answer_probe_prompt(selected_candidates: list[dict[str, Any]], *, probe_count: int) -> str:
+    blocks = []
+    for candidate in selected_candidates:
+        tuple_row = candidate["tuple"]
+        item_question = str((candidate.get("generated_item") or {}).get("question") or "").strip()
+        if not item_question:
+            continue
+        blocks.append(
+            "\n".join(
+                [
+                    f"--- Candidate {candidate['candidate_index']} ---",
+                    f"candidate_index: {candidate['candidate_index']}",
+                    f"question_type: {candidate['question_type']}",
+                    f'question: "{item_question}"',
+                    f'anchor_label: "{candidate_anchor_label(candidate)}"',
+                    f'text_gold: "{tuple_row.get("answer") or ""}"',
+                    "Give several independent short answers to the same visual question.",
+                    "Each answer must be literal and brief. Do not explain.",
+                ]
+            )
+        )
+    return (
+        "You are probing answer ambiguity for OCR spatial QA.\n"
+        f"For each candidate below, answer the same question {probe_count} times independently using the image.\n"
+        "Return JSON only.\n\n"
+        + "\n\n".join(blocks)
+    )
+
+
+def call_gemini_answer_probe_batched(
+    *,
+    model: str,
+    image_payload: Any,
+    selected_candidates: list[dict[str, Any]],
+    probe_count: int,
+    temperature: float,
+    timeout_s: int = 120,
+) -> dict[str, Any]:
+    body = {
+        "contents": [
+            {
+                "parts": [
+                    {"text": build_answer_probe_prompt(selected_candidates, probe_count=probe_count)},
+                    {
+                        "inline_data": {
+                            "mime_type": image_payload.mime_type,
+                            "data": image_payload.image_b64,
+                        }
+                    },
+                ]
+            }
+        ],
+        "generationConfig": {
+            "temperature": float(temperature),
+            "responseMimeType": "application/json",
+            "responseJsonSchema": answer_probe_response_schema(len(selected_candidates), int(probe_count)),
+        },
+    }
+    response = requests.post(
+        f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+        headers={
+            "x-goog-api-key": get_secret(GEMINI),
+            "Content-Type": "application/json",
+        },
+        json=body,
+        timeout=timeout_s,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    raw_text = extract_gemini_text(payload)
+    return {
+        "provider": "gemini",
+        "model": model,
+        "raw_text": raw_text,
+        "parsed": json.loads(raw_text),
+        "usage": payload.get("usageMetadata", {}),
+    }
+
+
+def _normalize_probe_answer(answer: str, tuple_row: dict[str, Any]) -> str:
+    return normalize_answer(answer)
+
+
+def annotate_answer_probe_rows(
+    *,
+    model: str,
+    image_payload: Any,
+    indexed_candidates: list[dict[str, Any]],
+    normalized_rows: list[dict[str, Any]],
+    tuning: Any,
+) -> None:
+    probe_count = int(tuning.teacher_answer_probe_count)
+    if probe_count <= 1:
+        return
+    eligible_rows = []
+    for candidate, row in zip(indexed_candidates, normalized_rows):
+        if not row.get("ok"):
+            continue
+        if candidate["question_type"] not in {"DIRECT_READ", "REVERSE_GROUND", "TEXT_PROPERTY"}:
+            continue
+        item = (row.get("items") or [{}])[0]
+        if not str(item.get("question") or "").strip():
+            continue
+        eligible_rows.append((candidate, row, item))
+    if not eligible_rows:
+        return
+    probe_candidates = []
+    for candidate, _, item in eligible_rows:
+        probe_candidates.append({**candidate, "generated_item": item})
+    try:
+        result = call_gemini_answer_probe_batched(
+            model=model,
+            image_payload=image_payload,
+            selected_candidates=probe_candidates,
+            probe_count=probe_count,
+            temperature=float(tuning.teacher_answer_probe_temperature),
+        )
+        items = list((result.get("parsed") or {}).get("items") or [])
+        by_index = {int(item.get("candidate_index")): item for item in items if item.get("candidate_index") is not None}
+    except Exception as exc:
+        by_index = {}
+        result = {"error": str(exc), "usage": {}}
+    for candidate, row, _ in eligible_rows:
+        item = by_index.get(int(candidate["candidate_index"])) or {}
+        answers = [str(x or "").strip() for x in (item.get("answers") or [])]
+        normalized = [_normalize_probe_answer(answer, candidate["tuple"]) for answer in answers if answer]
+        counts = Counter(normalized)
+        distinct_count = len(counts)
+        plurality_answer = max(counts.items(), key=lambda kv: (kv[1], kv[0]))[0] if counts else ""
+        plurality_count = int(max(counts.values()) if counts else 0)
+        row["answer_probe"] = {
+            "enabled": True,
+            "count": probe_count,
+            "temperature": float(tuning.teacher_answer_probe_temperature),
+            "answers": answers,
+            "normalized_answers": normalized,
+            "distinct_count": distinct_count,
+            "plurality_answer": plurality_answer,
+            "plurality_count": plurality_count,
+            "ambiguous": distinct_count >= 2,
+            "usage": result.get("usage", {}),
+            "error": result.get("error"),
+        }
+
+
+def apply_answer_probe_policy(normalized_rows: list[dict[str, Any]], *, tuning: Any) -> None:
+    if int(tuning.teacher_answer_probe_count) <= 1:
+        return
+    for row in normalized_rows:
+        probe = row.get("answer_probe") or {}
+        if not probe or not probe.get("enabled") or not probe.get("ambiguous"):
+            continue
+        question_type = str(((row.get("tuple") or {}).get("question_type") or "")).upper()
+        plurality_count = int(probe.get("plurality_count") or 0)
+        distinct_count = int(probe.get("distinct_count") or 0)
+        strict_probe_failure = False
+        if question_type == "DIRECT_READ":
+            strict_probe_failure = distinct_count >= 3 or plurality_count <= 1
+        elif question_type == "REVERSE_GROUND":
+            strict_probe_failure = distinct_count >= 3 and plurality_count <= 1
+        if not strict_probe_failure:
+            continue
+        validations = list(row.get("validations") or [])
+        validation = dict(validations[0] if validations else {})
+        validation["accepted"] = False
+        validation["mechanical_ok"] = False
+        validation["answer_probe_ambiguous"] = True
+        row["validations"] = [validation]
+        row["summary"] = {"generated_count": 1, "accepted_count": 0}
+        row["failure_reason"] = "answer_probe_ambiguous"
+        row["filter_stage"] = {"reason": "answer_probe_ambiguous"}
 
 
 def extract_gemini_text(payload: dict[str, Any]) -> str:
@@ -2126,6 +2820,8 @@ def normalize_candidate_result(
             "query_specific_location_synonyms": list(candidate.get("query_specific_location_synonyms") or []),
             "query_relation": candidate.get("query_relation"),
             "query_location_required": bool(candidate.get("query_location_required")),
+            "query_group_mode": candidate.get("query_group_mode"),
+            "query_group_count": candidate.get("query_group_count"),
             "reverse_ground_scope_preference": candidate.get("reverse_ground_scope_preference"),
             "grounded_exclusion_score": candidate.get("grounded_exclusion_score"),
             "grounded_exclusion_source_tuple_id": candidate.get("grounded_exclusion_source_tuple_id"),
@@ -2176,6 +2872,32 @@ def validate_candidate_output(candidate: dict[str, Any], item: dict[str, Any] | 
     explicit_specific_required = bool(ambiguity_hard and ambiguity_requires_explicit_specific(tuple_row))
     reverse_disambiguated_ok = bool(specific_location_ok or (anchor_local_ok and location_ok))
     unique_skip_location = _unique_anchor_can_skip_global_location(candidate)
+    strong_specific_grounding_ok = bool(candidate_specific_location_synonyms(candidate) and specific_location_ok)
+    disambiguation_required = candidate_requires_anchor_disambiguation(candidate)
+    cheap_proxy_score = candidate_cheap_ambiguity_proxy_score(candidate)
+    cheap_proxy_hard = bool(tuning.cheap_ambiguity_proxy_enabled and cheap_proxy_score >= tuning.cheap_ambiguity_proxy_reject_score)
+    grouped_scene_read = bool(candidate_scene_repeat_group_mode(candidate))
+    base_anchor_norm = normalize_answer(candidate_anchor_label(candidate))
+    disambiguation_ok = any(
+        (norm := normalize_answer(cue))
+        and norm != base_anchor_norm
+        and (norm in normalized_question or norm in normalized_answer)
+        for cue in candidate_disambiguation_cues(candidate)
+    )
+
+    if tuning.answer_leakage_filter_enabled and candidate_has_answer_leakage(candidate, question):
+        return {
+            "answer_ok": False,
+            "anchor_ok": anchor_ok,
+            "length_ok": length_ok,
+            "duplicate_ok": True,
+            "accepted": False,
+            "question_type_ok": question_type_ok,
+            "mechanical_ok": False,
+            "cheap_ambiguity_proxy_score": candidate_cheap_ambiguity_proxy_score(candidate),
+            "group_mode": candidate_scene_repeat_group_mode(candidate),
+            "failure_reason": "answer_leakage_trivial",
+        }
 
     if candidate["question_type"] == "DIRECT_READ":
         answer_ok = normalized_answer == normalize_answer(str(candidate["expected_answer"]))
@@ -2191,13 +2913,23 @@ def validate_candidate_output(candidate: dict[str, Any], item: dict[str, Any] | 
         elif explicit_specific_required and not unique_skip_location and not specific_location_ok:
             mechanical_ok = False
             failure_reason = "direct_read_specific_location_missing"
-        elif ambiguity_hard and not disambiguated_ok:
+        elif ambiguity_hard and not disambiguated_ok and not strong_specific_grounding_ok:
             mechanical_ok = False
             failure_reason = "ambiguous_grounding"
-        elif tuning.dr_ambiguity_reject_score >= 0 and ambiguity_score >= tuning.dr_ambiguity_reject_score:
+        elif (
+            tuning.dr_ambiguity_reject_score >= 0
+            and ambiguity_score >= tuning.dr_ambiguity_reject_score
+            and not strong_specific_grounding_ok
+        ):
             # DR-specific ambiguity reject: tighter threshold than global gate for DIRECT_READ
             mechanical_ok = False
             failure_reason = "dr_high_ambiguity"
+        elif disambiguation_required and not disambiguation_ok:
+            mechanical_ok = False
+            failure_reason = "anchor_instance_ambiguous"
+        elif cheap_proxy_hard and not grouped_scene_read and not (strong_specific_grounding_ok or disambiguation_ok):
+            mechanical_ok = False
+            failure_reason = "cheap_proxy_ambiguous"
     elif candidate["question_type"] == "YES_NO":
         answer_ok = normalized_answer == normalize_answer(str(candidate["expected_answer"]))
         queried_ok = normalize_answer(str(candidate["queried_text"])) in normalized_question
@@ -2218,6 +2950,12 @@ def validate_candidate_output(candidate: dict[str, Any], item: dict[str, Any] | 
         elif ambiguity_hard and not disambiguated_ok:
             mechanical_ok = False
             failure_reason = "ambiguous_grounding"
+        elif disambiguation_required and not disambiguation_ok:
+            mechanical_ok = False
+            failure_reason = "anchor_instance_ambiguous"
+        elif cheap_proxy_hard and not grouped_scene_read and not (strong_specific_grounding_ok or disambiguation_ok):
+            mechanical_ok = False
+            failure_reason = "cheap_proxy_ambiguous"
     elif candidate["question_type"] == "TEXT_PROPERTY":
         property_type = str(candidate["text_property_type"] or "")
         property_terms = TEXT_PROPERTY_TYPE_TERMS.get(property_type, ())
@@ -2248,6 +2986,12 @@ def validate_candidate_output(candidate: dict[str, Any], item: dict[str, Any] | 
         elif ambiguity_hard and not disambiguated_ok:
             mechanical_ok = False
             failure_reason = "ambiguous_grounding"
+        elif disambiguation_required and not disambiguation_ok:
+            mechanical_ok = False
+            failure_reason = "anchor_instance_ambiguous"
+        elif cheap_proxy_hard and not grouped_scene_read and not (strong_specific_grounding_ok or disambiguation_ok):
+            mechanical_ok = False
+            failure_reason = "cheap_proxy_ambiguous"
     elif candidate["question_type"] == "REVERSE_GROUND":
         query_ok = normalize_answer(str(tuple_row["answer"])) in normalized_question
         # Frontier style allows 1-word answers (e.g., "on the bottle" → sometimes just "bottle").
@@ -2271,14 +3015,23 @@ def validate_candidate_output(candidate: dict[str, Any], item: dict[str, Any] | 
         elif ambiguity_reverse and not (specific_location_ok or anchor_local_ok):
             mechanical_ok = False
             failure_reason = "reverse_ground_ambiguous"
+        elif disambiguation_required and not disambiguation_ok:
+            mechanical_ok = False
+            failure_reason = "anchor_instance_ambiguous"
+        elif cheap_proxy_hard and not grouped_scene_read and not reverse_disambiguated_ok:
+            mechanical_ok = False
+            failure_reason = "cheap_proxy_ambiguous"
     elif candidate["question_type"] == "ANCHOR_PROPERTY":
-        answer_ok = 1 <= len(answer.split()) <= 4 and len(answer.strip()) >= 2
         property_terms = ANCHOR_PROPERTY_TYPE_TERMS.get(str(candidate.get("anchor_property_type") or "anchor_color"), ())
         property_ok = any(normalize_answer(term) in normalized_question for term in property_terms)
         reference_text = normalize_answer(str(candidate.get("query_text_reference") or tuple_row["answer"]))
         reference_text_ok = reference_text in normalized_question or any(normalize_answer(word) in normalized_question for word in tuple_row.get("child_words") or [])
         location_required = bool(candidate.get("query_location_required"))
         location_match_ok = specific_location_ok if candidate_specific_location_synonyms(candidate) else (location_ok or anchor_local_ok)
+        if candidate.get("answer_source") == "mechanical_color" and candidate.get("expected_answer"):
+            answer_ok = normalized_answer == normalize_answer(str(candidate["expected_answer"]))
+        else:
+            answer_ok = 1 <= len(answer.split()) <= 4 and len(answer.strip()) >= 2
         mechanical_ok = bool(answer_ok and anchor_ok and reference_text_ok and property_ok and (not location_required or location_match_ok))
         if not answer_ok:
             failure_reason = "anchor_property_answer_invalid"
@@ -2296,8 +3049,19 @@ def validate_candidate_output(candidate: dict[str, Any], item: dict[str, Any] | 
         elif ambiguity_hard and not disambiguated_ok:
             mechanical_ok = False
             failure_reason = "ambiguous_grounding"
+        elif disambiguation_required and not disambiguation_ok:
+            mechanical_ok = False
+            failure_reason = "anchor_instance_ambiguous"
+        elif cheap_proxy_hard and not grouped_scene_read and not (strong_specific_grounding_ok or disambiguation_ok):
+            mechanical_ok = False
+            failure_reason = "cheap_proxy_ambiguous"
 
-    grounding_ok = bool(anchor_ok or anchor_local_ok or (candidate["question_type"] == "REVERSE_GROUND" and (location_ok or specific_location_ok)))
+    grounding_ok = bool(
+        anchor_ok
+        or anchor_local_ok
+        or (candidate["question_type"] == "REVERSE_GROUND" and (location_ok or specific_location_ok))
+        or (candidate["question_type"] in {"DIRECT_READ", "YES_NO", "TEXT_PROPERTY"} and strong_specific_grounding_ok)
+    )
     accepted = bool(grounding_ok and length_ok and question_type_ok and mechanical_ok)
     validation = {
         "answer_ok": answer_ok,
@@ -2307,6 +3071,8 @@ def validate_candidate_output(candidate: dict[str, Any], item: dict[str, Any] | 
         "accepted": accepted,
         "question_type_ok": question_type_ok,
         "mechanical_ok": mechanical_ok,
+        "cheap_ambiguity_proxy_score": cheap_proxy_score,
+        "group_mode": candidate_scene_repeat_group_mode(candidate),
     }
     if accepted:
         failure_reason = None
@@ -2334,6 +3100,7 @@ def row_to_final_sample(row: dict[str, Any], *, model: str, prompt_variant: str)
         "anchor_synonyms": tuple_row["anchor_synonyms"],
         "anchor_local_phrase": tuple_row.get("anchor_local_phrase"),
         "anchor_local_synonyms": tuple_row.get("anchor_local_synonyms"),
+        "anchor_color": tuple_row.get("anchor_color") or extract_anchor_color(str(tuple_row.get("anchor_label") or "")),
         "anchor_region_phrase": candidate_anchor_region_phrase({"tuple": tuple_row}),
         "anchor_region_synonyms": candidate_anchor_region_synonyms({"tuple": tuple_row}),
         "relation": tuple_row["relation"],
@@ -2346,6 +3113,7 @@ def row_to_final_sample(row: dict[str, Any], *, model: str, prompt_variant: str)
         "specific_location_synonyms": tuple_row.get("specific_location_synonyms"),
         "query_anchor_label": tuple_row.get("query_anchor_label"),
         "query_anchor_synonyms": tuple_row.get("query_anchor_synonyms"),
+        "query_anchor_color": tuple_row.get("query_anchor_color"),
         "query_anchor_box": tuple_row.get("query_anchor_box"),
         "query_anchor_local_phrase": tuple_row.get("query_anchor_local_phrase"),
         "query_anchor_local_synonyms": tuple_row.get("query_anchor_local_synonyms"),
@@ -2371,6 +3139,8 @@ def row_to_final_sample(row: dict[str, Any], *, model: str, prompt_variant: str)
         grounding["semantic_debug"] = tuple_row["semantic_debug"]
     kd_metadata = dict(tuple_row["kd_metadata"])
     kd_metadata["teacher_answer_logprobs"] = None
+    if row.get("answer_probe") is not None:
+        kd_metadata["answer_probe"] = row["answer_probe"]
     return {
         "sample_id": row["sample_id"],
         "image_id": tuple_row["image_id"],

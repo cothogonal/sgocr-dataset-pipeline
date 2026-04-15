@@ -9,9 +9,11 @@ from sgocr.dev200_eval import (
     SweepRun,
     _build_pointing_row,
     _content_word_f1,
+    _parse_ambiguity_response,
     _partial_correct_direct_read,
     _score_prediction,
     compute_frontier_agreement,
+    compute_frontier_ambiguity_agreement,
     prepare_bridge_ft_eval,
 )
 
@@ -125,6 +127,56 @@ class TestDev200Eval(unittest.TestCase):
             self.assertEqual(len(summary["pairwise"]), 1)
             self.assertAlmostEqual(summary["pairwise"][0]["agreement_rate"], 0.5)
 
+    def test_compute_frontier_ambiguity_agreement_outputs_pairwise_rates(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            bench = Path(td)
+            rows = [
+                {
+                    "sample_id": "s1",
+                    "provider": "openai",
+                    "model": "gpt-5.3-codex",
+                    "ambiguous": True,
+                    "question_type": "DIRECT_READ",
+                    "difficulty": "easy",
+                    "ambiguity_level": "medium",
+                },
+                {
+                    "sample_id": "s1",
+                    "provider": "gemini",
+                    "model": "gemini-3-flash-preview",
+                    "ambiguous": True,
+                    "question_type": "DIRECT_READ",
+                    "difficulty": "easy",
+                    "ambiguity_level": "medium",
+                },
+                {
+                    "sample_id": "s2",
+                    "provider": "openai",
+                    "model": "gpt-5.3-codex",
+                    "ambiguous": False,
+                    "question_type": "YES_NO",
+                    "difficulty": "medium",
+                    "ambiguity_level": "low",
+                },
+                {
+                    "sample_id": "s2",
+                    "provider": "gemini",
+                    "model": "gemini-3-flash-preview",
+                    "ambiguous": True,
+                    "question_type": "YES_NO",
+                    "difficulty": "medium",
+                    "ambiguity_level": "low",
+                },
+            ]
+            with (bench / "ambiguity_predictions.jsonl").open("w", encoding="utf-8") as f:
+                for row in rows:
+                    f.write(json.dumps(row) + "\n")
+            summary = compute_frontier_ambiguity_agreement(benchmark_dir=bench)
+            self.assertEqual(summary["rows"], 2)
+            self.assertAlmostEqual(summary["overall_unanimous_rate"], 0.5)
+            self.assertEqual(len(summary["pairwise"]), 1)
+            self.assertAlmostEqual(summary["pairwise"][0]["agreement_rate"], 0.5)
+
 
 class TestScoringFunctions(unittest.TestCase):
     # -----------------------------------------------------------------
@@ -218,6 +270,19 @@ class TestScoringFunctions(unittest.TestCase):
         self.assertTrue(result["soft_correct"])
         self.assertFalse(result["semantic_correct"])
         self.assertFalse(result["partial_correct"])
+
+    def test_parse_ambiguity_response_json(self) -> None:
+        parsed = _parse_ambiguity_response('{"ambiguous": true, "confidence": 0.75, "reason": "two similar signs"}')
+        self.assertTrue(parsed["ambiguous"])
+        self.assertAlmostEqual(parsed["confidence"], 0.75)
+        self.assertEqual(parsed["reason"], "two similar signs")
+        self.assertTrue(parsed["parse_ok"])
+
+    def test_parse_ambiguity_response_fenced(self) -> None:
+        parsed = _parse_ambiguity_response('```json\\n{"ambiguous": false, "confidence": 1.0, "reason": "unique text"}\\n```')
+        self.assertFalse(parsed["ambiguous"])
+        self.assertAlmostEqual(parsed["confidence"], 1.0)
+        self.assertEqual(parsed["reason"], "unique text")
 
 
 if __name__ == "__main__":

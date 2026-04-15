@@ -3,13 +3,18 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from PIL import Image
 
-from .semantic_grounding import sanitize_anchor_label
+from .semantic_grounding import (
+    QWEN_INDEPENDENT_RAW_INVENTORY_CATEGORY_TEXT,
+    normalize_independent_anchor_label,
+    sanitize_anchor_label,
+)
 
 
 OFFICIAL_QWEN_BBOX_PROMPT = (
@@ -21,6 +26,192 @@ OPEN_QWEN_LOCAL_DISCOVERY_PROMPT = (
     'Locate the visible objects, surfaces, or object parts in this crop that could naturally anchor nearby text. '
     'Report bbox coordinates in JSON format like this: {{"bbox_2d": [x1, y1, x2, y2], "label": "object"}}.'
 )
+
+OPEN_QWEN_LOCAL_DISCOVERY_PROMPT_COLOR_SPECIFIC = (
+    'Locate the visible objects, surfaces, or object parts in this crop that could naturally anchor nearby text. '
+    'Prefer specific visible object or object-part labels over generic text surfaces. '
+    'Include a visible color adjective when it is clear and stable, for example "red jersey", "blue sign", "silver car door", or "white airplane tail". '
+    'Avoid generic labels like "sign wall", "display panel", or "object" when a more specific visible object exists. '
+    'Report bbox coordinates in JSON format like this: {{"bbox_2d": [x1, y1, x2, y2], "label": "object"}}.'
+)
+
+INDEPENDENT_QWEN_INVENTORY_PROMPT = OFFICIAL_QWEN_BBOX_PROMPT.format(
+    categories=QWEN_INDEPENDENT_RAW_INVENTORY_CATEGORY_TEXT
+)
+
+# Structural fallback prompt: used when the standard inventory returns degenerate results
+# (e.g. "all visible objects" for chart/infographic images that lack identifiable scene objects).
+# Focuses on bounded visual regions and shapes rather than named scene objects, so it works
+# for charts, documents, diagrams, and any image where object vocabulary is inappropriate.
+STRUCTURAL_FALLBACK_QWEN_PROMPT = (
+    "Locate the distinct bounded visual regions or shapes in this image that contain or are "
+    "immediately adjacent to text. Focus on shapes with clear edges: bars, segments, panels, "
+    "plates, buttons, emblems, signs, or labeled surface areas. Prefer specific visible structural "
+    "labels based on shape and context, for example 'bar chart segment', 'pie chart wedge', "
+    "'legend panel', 'table cell', or 'circular badge'. Do not use the actual color as the "
+    "primary label component — describe the shape or region type first. "
+    "Avoid generic labels like 'all visible objects' or 'image area'. "
+    'Report bbox coordinates in JSON format like this: {{"bbox_2d": [x1, y1, x2, y2], "label": "shape"}}.'
+)
+
+GROUNDBACK_QWEN_PROMPT = (
+    'Locate the single element described as: "{label}". '
+    'If present, report its bbox in JSON format like this: {{"bbox_2d": [x1, y1, x2, y2], "label": "element"}}. '
+    'Report only one bbox for the best match.'
+)
+
+_DEGENERATE_LABELS = frozenset({
+    "all visible objects",
+    "all objects",
+    "unknown",
+    "all visible text",
+    "image",
+    "scene",
+    "",
+})
+
+# Anti-OCR suffix: appended to inventory prompts to discourage using visible text content as labels.
+# Without this, Qwen sometimes labels anchors with the text they contain (e.g. "DAN BROWN BREWING CO")
+# rather than the object type (e.g. "brewery sign"). This causes REVERSE_GROUND vision leakage.
+_ANTI_OCR_SUFFIX = (
+    " Label each detected region with a concise visual object or shape type — "
+    "never copy verbatim text content visible inside the region as the label."
+)
+
+INDEPENDENT_QWEN_INVENTORY_PROMPT_ANTI_OCR = INDEPENDENT_QWEN_INVENTORY_PROMPT.rstrip(".") + "." + _ANTI_OCR_SUFFIX
+STRUCTURAL_FALLBACK_QWEN_PROMPT_ANTI_OCR = STRUCTURAL_FALLBACK_QWEN_PROMPT.rstrip(".") + _ANTI_OCR_SUFFIX
+
+# Per-anchor degenerate label set: labels that are too generic or abstract to anchor a useful QA.
+# These are individual-anchor checks (not whole-image inventory checks like _DEGENERATE_LABELS).
+_DEGENERATE_ANCHOR_LABELS: frozenset[str] = frozenset({
+    "object part", "surface", "area", "region", "part", "section",
+    "texture", "background", "element", "item", "thing", "object",
+    "entity", "feature", "detail", "structure", "view", "content",
+}) | _DEGENERATE_LABELS
+
+
+def is_degenerate_anchor_label(label: str) -> bool:
+    """Return True if a single anchor label is too generic to anchor a useful QA.
+
+    Catches labels like 'object part', 'surface', 'area', 'unknown', '' etc.
+    """
+    norm = str(label or "").strip().lower()
+    if len(norm) <= 2:
+        return True
+    return norm in _DEGENERATE_ANCHOR_LABELS
+
+
+def is_ocr_text_label(label: str) -> bool:
+    """Return True if the anchor label looks like OCR-copied text rather than a visual object type.
+
+    Heuristics:
+    - Mostly uppercase tokens with spaces/punctuation (e.g. "DAN BROWN BREWING COMPANY")
+    - Multi-word title-case proper noun strings that are unusually long (e.g. "Springfield City Hall")
+    """
+    s = str(label or "").strip()
+    if len(s) < 5:
+        return False
+    tokens = s.split()
+    if len(tokens) < 2:
+        return False
+    # All-caps tokens dominate: e.g. "DAN BROWN BREWING CO" → 4/4 uppercase tokens
+    upper_count = sum(1 for t in tokens if t.replace("&", "").replace("'", "").replace(".", "").isupper() and t.isascii())
+    if upper_count >= max(2, len(tokens) - 1):
+        return True
+    # Multi-word title-case phrase that's unusually long (≥3 words, avg token len ≥ 5)
+    if len(tokens) >= 3 and all(t[0].isupper() for t in tokens if t[0].isalpha()):
+        avg_len = sum(len(t) for t in tokens) / len(tokens)
+        if avg_len >= 5:
+            return True
+    return False
+
+
+# Real object labels that should never trigger structural fallback even when concentrated.
+# A scene with 4 planes is not degenerate — it's a coherent airport image.
+_VALID_CONCENTRATED_LABELS: frozenset[str] = frozenset({
+    "plane", "airplane", "aircraft", "jet", "helicopter",
+    "car", "truck", "bus", "van", "vehicle", "motorcycle", "bicycle",
+    "person", "people", "man", "woman", "child",
+    "building", "house", "tower", "bridge",
+    "tree", "bush", "grass",
+    "bottle", "can", "cup", "glass",
+    "sign", "board", "poster", "banner",
+    "table", "chair", "desk", "shelf",
+    "screen", "monitor", "display",
+    "book", "box", "bag",
+    "door", "window",
+    "boat", "ship",
+    "dog", "cat", "bird",
+})
+
+
+def is_degenerate_inventory(rows: list[dict[str, Any]], *, threshold: float = 0.92) -> bool:
+    """Return True if the inventory result for one image is degenerate.
+
+    Degenerate means: most labels are the same catch-all phrase (e.g. 'all visible objects'),
+    OR the inventory is empty, OR a single label covers more than `threshold` fraction of rows
+    AND that label is not a valid real-world object (plane, car, person, etc.).
+
+    The valid-label exemption prevents airport images (all planes) or crowd images (all people)
+    from being flagged as degenerate and triggering the structural fallback unnecessarily.
+    """
+    if not rows:
+        return True
+    from collections import Counter
+    label_counts: Counter[str] = Counter()
+    for row in rows:
+        raw = str(row.get("label") or row.get("raw_label") or "").strip().lower()
+        label_counts[raw] += 1
+    total = len(rows)
+    most_common_label, most_common_count = label_counts.most_common(1)[0]
+    if most_common_label in _DEGENERATE_LABELS:
+        return True
+    if most_common_label in _VALID_CONCENTRATED_LABELS:
+        return False
+    return (most_common_count / total) >= threshold
+
+
+class _StageProgressLogger:
+    def __init__(self, stage_name: str, total: int) -> None:
+        self.stage_name = str(stage_name)
+        self.total = max(0, int(total))
+        self._start = time.time()
+        self._last_fraction = -1
+        self._path = Path(os.environ["SGOCR_PROGRESS_LOG_PATH"]).expanduser() if os.environ.get("SGOCR_PROGRESS_LOG_PATH") else None
+
+    def _emit(self, message: str) -> None:
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%S")
+        line = f"[{stamp}] [stage:{self.stage_name}] {message}"
+        print(line, flush=True)
+        if self._path is not None:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            with self._path.open("a", encoding="utf-8") as f:
+                f.write(line + "\n")
+
+    def start(self) -> None:
+        self._emit(f"start total={self.total}")
+
+    def tick(self, completed: int, *, extra: str = "") -> None:
+        if self.total <= 0:
+            return
+        completed = max(0, int(completed))
+        fraction = min(100, int((completed * 100) / self.total))
+        if completed < self.total and fraction <= self._last_fraction:
+            return
+        if completed < self.total and fraction < 1:
+            return
+        self._last_fraction = fraction
+        elapsed = max(time.time() - self._start, 1e-6)
+        rate = completed / elapsed if completed > 0 else 0.0
+        suffix = f" {extra}" if extra else ""
+        self._emit(
+            f"progress completed={completed}/{self.total} pct={fraction}% elapsed_s={elapsed:.1f} rate_per_s={rate:.2f}{suffix}"
+        )
+
+    def finish(self, *, extra: str = "") -> None:
+        elapsed = max(time.time() - self._start, 1e-6)
+        suffix = f" {extra}" if extra else ""
+        self._emit(f"finish completed={self.total}/{self.total} pct=100% elapsed_s={elapsed:.1f}{suffix}")
 
 
 def _lazy_import_vllm() -> tuple[Any, Any, Any, Any]:
@@ -89,6 +280,7 @@ class QwenAnchorRequest:
     image_obj: Image.Image | None = None
     prompt_text: str | None = None
     enforce_allowed_labels: bool = True
+    normalize_open_labels: bool = False
 
 
 def normalize_qwen_description(rows: list[dict[str, Any]]) -> dict[str, Any]:
@@ -134,6 +326,75 @@ def _normalize_to_allowed_label(label: str, allowed_categories: list[str]) -> st
     return None
 
 
+def _bbox_iou(box_a: list[float], box_b: list[float]) -> float:
+    ax1, ay1, ax2, ay2 = [float(value) for value in box_a[:4]]
+    bx1, by1, bx2, by2 = [float(value) for value in box_b[:4]]
+    inter_w = max(0.0, min(ax2, bx2) - max(ax1, bx1))
+    inter_h = max(0.0, min(ay2, by2) - max(ay1, by1))
+    inter_area = inter_w * inter_h
+    if inter_area <= 0.0:
+        return 0.0
+    area_a = max((ax2 - ax1) * (ay2 - ay1), 1e-6)
+    area_b = max((bx2 - bx1) * (by2 - by1), 1e-6)
+    return inter_area / max(area_a + area_b - inter_area, 1e-6)
+
+
+def merge_qwen_inventory_passes(
+    pass_results: list[dict[str, list[dict[str, Any]]]],
+    *,
+    iou_threshold: float = 0.55,
+    min_support: int = 1,
+) -> dict[str, list[dict[str, Any]]]:
+    merged: dict[str, list[dict[str, Any]]] = {}
+    image_ids = sorted({image_id for rows_by_image in pass_results for image_id in rows_by_image.keys()})
+    for image_id in image_ids:
+        clusters: list[list[dict[str, Any]]] = []
+        all_rows: list[dict[str, Any]] = []
+        for pass_index, rows_by_image in enumerate(pass_results):
+            for row in rows_by_image.get(image_id, []):
+                candidate = dict(row)
+                candidate["_pass_index"] = pass_index
+                candidate["label"] = (
+                    normalize_independent_anchor_label(str(candidate.get("raw_label") or candidate.get("label") or ""))
+                    or str(candidate.get("label") or "").strip().lower()
+                )
+                if not str(candidate.get("label") or "").strip():
+                    continue
+                all_rows.append(candidate)
+        all_rows.sort(key=lambda row: (-float(row.get("score") or 0.0), row.get("label") or ""))
+        for row in all_rows:
+            placed = False
+            for cluster in clusters:
+                exemplar = cluster[0]
+                if str(exemplar.get("label") or "") != str(row.get("label") or ""):
+                    continue
+                if _bbox_iou(list(exemplar.get("box") or []), list(row.get("box") or [])) >= iou_threshold:
+                    cluster.append(row)
+                    placed = True
+                    break
+            if not placed:
+                clusters.append([row])
+        image_rows: list[dict[str, Any]] = []
+        for cluster in clusters:
+            pass_support = len({int(row.get("_pass_index") or 0) for row in cluster})
+            if pass_support < max(1, int(min_support)):
+                continue
+            representative = max(cluster, key=lambda row: (float(row.get("score") or 0.0), str(row.get("raw_label") or "")))
+            alternate_labels = sorted({str(row.get("raw_label") or row.get("label") or "").strip() for row in cluster if str(row.get("raw_label") or row.get("label") or "").strip()})
+            merged_row = {
+                key: value
+                for key, value in representative.items()
+                if not str(key).startswith("_")
+            }
+            merged_row["score"] = round(float(merged_row.get("score") or 0.0) + 0.03 * max(0, pass_support - 1), 4)
+            merged_row["source"] = "qwen3_vl_vllm_inventory"
+            merged_row["pass_support_count"] = pass_support
+            merged_row["alternate_labels"] = alternate_labels
+            image_rows.append(merged_row)
+        merged[image_id] = image_rows
+    return merged
+
+
 class QwenAnchorGrounderVLLM:
     def __init__(
         self,
@@ -147,6 +408,7 @@ class QwenAnchorGrounderVLLM:
     ) -> None:
         process_vision_info, AutoProcessor, LLM, SamplingParams = _lazy_import_vllm()
         self._process_vision_info = process_vision_info
+        self._SamplingParams = SamplingParams
         self._processor = AutoProcessor.from_pretrained(model_name)
         self._llm = LLM(
             model=model_name,
@@ -186,11 +448,23 @@ class QwenAnchorGrounderVLLM:
             "mm_processor_kwargs": video_kwargs,
         }
 
-    def detect_many(self, requests: list[QwenAnchorRequest]) -> dict[str, list[dict[str, Any]]]:
+    def detect_many(
+        self,
+        requests: list[QwenAnchorRequest],
+        *,
+        progress_logger: _StageProgressLogger | None = None,
+        sampling_temperature: float | None = None,
+    ) -> dict[str, list[dict[str, Any]]]:
         if not requests:
             return {}
+        owns_progress = False
+        if progress_logger is None:
+            progress_logger = _StageProgressLogger("qwen_detect_many", len(requests))
+            progress_logger.start()
+            owns_progress = True
         inputs: list[dict[str, Any]] = []
         image_sizes: dict[str, tuple[int, int]] = {}
+        request_prompts: dict[str, str] = {}
         for req in requests:
             image_ref: Any
             if req.image_obj is not None:
@@ -207,6 +481,7 @@ class QwenAnchorGrounderVLLM:
             image_sizes[req.image_id] = (width, height)
             categories = ", ".join(dict.fromkeys(cat for cat in req.categories if str(cat).strip()))
             prompt = req.prompt_text or OFFICIAL_QWEN_BBOX_PROMPT.format(categories=categories)
+            request_prompts[req.image_id] = prompt
             messages = [
                 {
                     "role": "user",
@@ -223,10 +498,19 @@ class QwenAnchorGrounderVLLM:
             ]
             inputs.append(self._prepare_inputs_for_vllm(messages))
         out: dict[str, list[dict[str, Any]]] = {}
+        completed = 0
+        sampling_params = self._sampling_params
+        if sampling_temperature is not None and float(sampling_temperature) != float(self._sampling_params.temperature):
+            sampling_params = self._SamplingParams(
+                temperature=float(sampling_temperature),
+                max_tokens=768,
+                top_k=-1,
+                stop_token_ids=[],
+            )
         for start in range(0, len(inputs), self._batch_size):
             batch_requests = requests[start : start + self._batch_size]
             batch_inputs = inputs[start : start + self._batch_size]
-            outputs = self._llm.generate(batch_inputs, sampling_params=self._sampling_params)
+            outputs = self._llm.generate(batch_inputs, sampling_params=sampling_params)
             for req, output in zip(batch_requests, outputs):
                 width, height = image_sizes[req.image_id]
                 generated_text = output.outputs[0].text if output.outputs else ""
@@ -234,7 +518,12 @@ class QwenAnchorGrounderVLLM:
                 for item in _iter_json_candidates(generated_text):
                     bbox = item.get("bbox_2d")
                     raw_label = str(item.get("label") or "").strip()
-                    label = _normalize_to_allowed_label(raw_label, req.categories) if req.enforce_allowed_labels else raw_label
+                    if req.enforce_allowed_labels:
+                        label = _normalize_to_allowed_label(raw_label, req.categories)
+                    elif req.normalize_open_labels:
+                        label = normalize_independent_anchor_label(raw_label)
+                    else:
+                        label = raw_label
                     if not isinstance(bbox, list) or len(bbox) < 4 or not label:
                         continue
                     rows.append(
@@ -244,12 +533,74 @@ class QwenAnchorGrounderVLLM:
                             "box": _scale_relative_bbox(bbox, width=width, height=height),
                             "score": 0.62,
                             "source": "qwen3_vl_vllm",
-                            "prompt_text": prompt,
+                            "prompt_text": request_prompts[req.image_id],
                             "raw_text": generated_text,
                         }
                     )
                 out[req.image_id] = rows
+                completed += 1
+                progress_logger.tick(completed, extra=f"image_id={req.image_id} rows={len(rows)}")
+        if owns_progress:
+            progress_logger.finish(extra=f"images={len(out)}")
         return out
+
+    def groundback_check_many(
+        self,
+        image_anchors_by_image: dict[str, list[dict[str, Any]]],
+        *,
+        image_path_by_image: dict[str, str],
+    ) -> dict[str, list[tuple[int, float]]]:
+        """Re-ground each anchor label to verify it uniquely identifies the element.
+
+        For every anchor in image_anchors_by_image (for images present in image_path_by_image),
+        runs a single Qwen inference with only the label text as the query. The returned bbox
+        is compared to the original anchor bbox via IoU.
+
+        Returns dict[image_id, list[(anchor_idx, iou)]]. Anchors with no Qwen output or where
+        Qwen returns a bbox that doesn't match the original get iou=0.0 (treated as failed by
+        the caller). Images missing from image_path_by_image are skipped silently.
+        """
+        # Build a flat list of (image_id, anchor_idx, anchor) for all anchors to check.
+        work: list[tuple[str, int, dict[str, Any]]] = []
+        for image_id, anchors in image_anchors_by_image.items():
+            if image_id not in image_path_by_image:
+                continue
+            for idx, anchor in enumerate(anchors):
+                label = str(anchor.get("label") or "").strip()
+                if label:
+                    work.append((image_id, idx, anchor))
+
+        if not work:
+            return {}
+
+        # Each groundback query gets a unique synthetic image_id so results can be matched back.
+        qwen_requests = [
+            QwenAnchorRequest(
+                image_id=f"{image_id}::gb::{anchor_idx}",
+                image_path=image_path_by_image[image_id],
+                categories=[],
+                prompt_text=GROUNDBACK_QWEN_PROMPT.format(label=anchor["label"]),
+                enforce_allowed_labels=False,
+                normalize_open_labels=False,
+            )
+            for image_id, anchor_idx, anchor in work
+        ]
+
+        raw_out = self.detect_many(qwen_requests)
+
+        results: dict[str, list[tuple[int, float]]] = {}
+        for image_id, anchor_idx, anchor in work:
+            key = f"{image_id}::gb::{anchor_idx}"
+            rows = raw_out.get(key, [])
+            original_box = list(anchor.get("box") or [])
+            if not rows or len(original_box) < 4:
+                iou = 0.0
+            else:
+                best_iou = max(_bbox_iou(original_box, list(row.get("box") or [])) for row in rows)
+                iou = round(best_iou, 4)
+            results.setdefault(image_id, []).append((anchor_idx, iou))
+
+        return results
 
     def close(self) -> None:
         del self._llm
