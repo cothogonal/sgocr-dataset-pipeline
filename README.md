@@ -75,28 +75,27 @@ Stage A — OCR
   Nemotron OCR v2  (NVIDIA)
   → text bounding boxes + confidence scores → text_nodes.jsonl
 
-Stage B — Anchor Tag Discovery
-  Florence-2-large  (region captioning, seeded with image context)
-  → candidate anchor label vocabulary per image
-
-Stage C — Anchor Candidate Generation + Groundback
-  Qwen3-VL-8B-Instruct-FP8  (vLLM, multi-pass visual inventory)
-  GroundingDINO-base         (groundback: re-localises each anchor label,
-                              rejects candidates with IoU < 0.40)
+Stage B — Anchor Candidate Generation + Groundback
+  Qwen3-VL-8B-Instruct-FP8  (vLLM, independent raw visual inventory —
+                              Qwen generates its own anchor vocabulary
+                              without any Florence seed tags)
+  Qwen3-VL-8B-Instruct-FP8  (groundback: re-localises each anchor label
+                              with a single Qwen inference, rejects
+                              candidates with IoU < 0.40)
   → grounded_anchors.jsonl
 
-Stage D — Tuple Construction + Geometric Filtering
+Stage C — Tuple Construction + Geometric Filtering
   centroid offset gate   (min spatial offset filters text trivially locatable by position alone)
   type-constrained selection  (target=5 QAs/image, RG hard cap=2, TP/AP selection bonus=0.5,
                                RG oversample boost=1.5)
   RG leakage check       (strips color/shape tokens from REVERSE_GROUND anchor labels, re-probes)
   → selected_tuples.jsonl
 
-Stage E — Teacher QA Generation
+Stage D — Teacher QA Generation
   Gemini 2.5 Flash  (question + answer from (image, anchor, text_node) tuple)
   → raw_qa.jsonl
 
-Stage F — Packaging
+Stage E — Packaging
   → ocr_qa_dataset.jsonl
 ```
 
@@ -114,7 +113,7 @@ Stage F — Packaging
 
 Two passes run at the end of each sweep to measure dataset quality:
 
-- **Inline frontier scoring** — Gemini 2.5 Flash answers every accepted QA with the image in context. Soft-match against gold answer produces a per-run `sweep_score` for variant comparison.
+- **Inline frontier scoring** — Gemini 3 Flash Preview answers every accepted QA with the image in context. Soft-match against gold answer produces a per-run `sweep_score` for variant comparison.
 - **Image-dependence eval** — Gemini 3 Flash Preview answers each QA twice: once with image+question, once with text-only. The gap between the two measures how much the image is actually required. *Vision-necessary rate* (image correct, text-only wrong) and *text-leaky rate* (text-only correct) are the primary output quality signals.
 
 ---
