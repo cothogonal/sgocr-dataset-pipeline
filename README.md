@@ -95,15 +95,15 @@ Question types:
 
 ## Sample Rows
 
-**DIRECT_READ** — *"What text is on the headlight?"* → **CATERPILLAR**
+**DIRECT_READ** — *"What text is on the black laptop open lid in the left half of the image?"* → **ubuntu**
 
 ![DIRECT_READ sample](assets/sample_direct_read.jpg)
 
-**REVERSE_GROUND** — *"Where does the text 'SAS' appear?"* → **on the airplane sas livery**
+**REVERSE_GROUND** — *"Where is the text 'mandalina' located?"* → **upper text in the lower-left area of the image**
 
 ![REVERSE_GROUND sample](assets/sample_reverse_ground.jpg)
 
-Both rows share the same schema:
+Both samples are from the `ita13_propbonus_offset20` v0 build (315 accepted QAs, target=5, cap=2, boost=1.5, offset=0.20, prop_bonus=0.5). Both rows share the same schema:
 
 ```json
 {
