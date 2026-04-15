@@ -95,13 +95,13 @@ Question types:
 
 ## Sample Rows
 
-**DIRECT_READ** — *"What text is on the panel, specifically the lower-right text within the lower-right area of the image?"* → **2021**
+**DIRECT_READ** — *"What text is on the headlight?"* → **CATERPILLAR**
 
-![DIRECT_READ sample](assets/sample_direct_read.png)
+![DIRECT_READ sample](assets/sample_direct_read.jpg)
 
-**REVERSE_GROUND** — *"Where does the text 'Information' appear?"* → **on the button**
+**REVERSE_GROUND** — *"Where does the text 'SAS' appear?"* → **on the airplane sas livery**
 
-![REVERSE_GROUND sample](assets/sample_reverse_ground.png)
+![REVERSE_GROUND sample](assets/sample_reverse_ground.jpg)
 
 Both rows share the same schema:
 
