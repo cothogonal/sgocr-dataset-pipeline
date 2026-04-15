@@ -68,28 +68,55 @@ PYTHONPATH=sgocr/src python -m sgocr.scripts.mixed_ita13_sweep \
 
 ## Pipeline Overview
 
-Each run processes a dev set of OCR-rich images through these stages:
-
 ```
-raw images
-  → OCR extraction (Qwen2-VL)
-  → anchor grounding (bbox → text label)
-  → candidate generation (DR / RG / YN / TP / AP question types)
-  → type-constrained selection (target N QAs per image)
-  → inline frontier scoring (Gemini Flash)
-  → image-dependence eval (image+Q vs text-only accuracy)
-  → accepted dataset (ocr_qa_dataset.jsonl)
+Stage A — Text Detection
+  PaddleOCR PP-OCRv5_server_det
+  → raw bounding boxes
+
+Stage B — OCR Ensemble + Consensus
+  Nemotron OCR v2  (primary, NVIDIA)
+  PArSeq            (scene-text specialist)
+  TrOCR small + base (transformer OCR)
+  → confidence-weighted consensus → text_nodes.jsonl
+
+Stage C — Anchor Discovery + Grounding
+  Qwen3-VL via vLLM  (multi-pass visual inventory of anchor regions)
+  Florence-2-large   (region caption tagging)
+  GroundingDINO-base (groundback IoU verification — rejects hallucinated anchors)
+  → grounded_anchors.jsonl
+
+Stage D — Tuple Construction + Geometric Filtering
+  centroid offset gate  (spatial min-offset to avoid trivially locatable text)
+  IoU deduplication     (suppress overlapping candidates)
+  type-constrained selection  (target N QAs/image, per-type hard caps + score bonuses)
+  → selected_tuples.jsonl
+
+Stage E — Teacher QA Generation
+  Gemini 2.5 Flash  (generates question + answer from (image, anchor, text) tuple)
+  → raw_qa.jsonl
+
+Stage F — Verification + Packaging
+  RG leakage check     (strips color/shape tokens from REVERSE_GROUND anchors, re-probes)
+  groundback re-verify (final GroundingDINO pass on accepted tuples)
+  → ocr_qa_dataset.jsonl
 ```
 
-Question types:
+**Question types:**
 
 | Type | Description |
 |---|---|
 | `DIRECT_READ` | Read a specific text element from the image |
 | `REVERSE_GROUND` | Given text, locate or describe where it appears |
 | `YES_NO` | Boolean question about text presence/property |
-| `TEXT_PROPERTY` | Property of a text element (orientation, style…) |
-| `ANCHOR_PROPERTY` | Property of the object the text is anchored to |
+| `TEXT_PROPERTY` | Property of a text element (orientation, style, curvature…) |
+| `ANCHOR_PROPERTY` | Property of the object the text is anchored to (color, material…) |
+
+**Evaluation:**
+
+Two eval passes run automatically at the end of each sweep:
+
+- **Inline frontier scoring** — Gemini 2.5 Flash scores every accepted QA in context (image + question → predicted answer, soft-matched against gold). Produces a per-run `sweep_score` used to compare variants.
+- **Image-dependence eval** — Gemini 3 Flash Preview answers each QA twice: once with the image, once text-only. Vision-necessary rate (image correct, text wrong) and text-leaky rate (text-only correct) are the primary quality signals. A healthy dataset targets high vision-nec% and low text-leaky%.
 
 ---
 
