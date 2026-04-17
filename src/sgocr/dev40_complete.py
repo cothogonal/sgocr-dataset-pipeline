@@ -44,7 +44,7 @@ QUESTION_TYPES = ("DIRECT_READ", "YES_NO", "REVERSE_GROUND", "TEXT_PROPERTY", "A
 DISABLED_QUESTION_TYPES: tuple[str, ...] = ()
 URL_LIKE_RE = re.compile(r"(https?://|www\.|\.com\b|\.net\b|\.org\b|@)", re.IGNORECASE)
 TEXT_APPEARANCE_TERMS = ("text", "word", "words", "letters", "writing", "label")
-TEXT_PROPERTY_VISUAL_TYPES = ("text_color", "text_orientation", "text_curvature")
+TEXT_PROPERTY_VISUAL_TYPES = ("text_color", "text_curvature")
 TEXT_PROPERTY_TYPE_TERMS = {
     "word_count": ("how many words", "word count", "number of words"),
     "first_word": ("first word", "starts with"),
@@ -1030,8 +1030,10 @@ def requires_specific_location(tuple_row: dict[str, Any], question_type: str, *,
         return score >= tuning.yesno_positive_specific_threshold
     if question_type == "DIRECT_READ":
         return score >= tuning.direct_read_specific_threshold
-    if question_type in ("TEXT_PROPERTY", "ANCHOR_PROPERTY"):
+    if question_type == "TEXT_PROPERTY":
         return score >= tuning.property_specific_threshold and competing >= 1
+    if question_type == "ANCHOR_PROPERTY":
+        return score >= tuning.anchor_property_specific_threshold and competing >= 1
     return False
 
 
@@ -1571,6 +1573,20 @@ def run_teacher_batches(
             }
             return batch_row, rows
 
+    total_batches = len(image_batches)
+    completed_batches = 0
+
+    def _report_teacher_progress(batch_row: dict) -> None:
+        nonlocal completed_batches
+        completed_batches += 1
+        ok_flag = "ok" if batch_row.get("ok") else "err"
+        print(
+            f"[stage:teacher] progress {completed_batches}/{total_batches}"
+            f" selected={batch_row.get('selected_count', 0)} [{ok_flag}]"
+            f" image={batch_row.get('image_id', '?')}",
+            flush=True,
+        )
+
     if workers > 1:
         with ThreadPoolExecutor(max_workers=workers) as executor:
             futures = [executor.submit(run_one, batch) for batch in image_batches]
@@ -1578,11 +1594,13 @@ def run_teacher_batches(
                 batch_row, rows = future.result()
                 batch_rows.append(batch_row)
                 sample_rows.extend(rows)
+                _report_teacher_progress(batch_row)
     else:
         for batch in image_batches:
             batch_row, rows = run_one(batch)
             batch_rows.append(batch_row)
             sample_rows.extend(rows)
+            _report_teacher_progress(batch_row)
 
     batch_rows.sort(key=lambda row: row["image_id"])
     sample_rows.sort(key=lambda row: row["sample_id"])
@@ -2502,6 +2520,7 @@ def build_batched_prompt(selected_candidates: list[dict[str, Any]]) -> str:
             if candidate.get("query_location_required"):
                 lines.append(f'Mention the preferred specific location phrase "{preferred_location_phrase}" so the question clearly targets the correct text region.')
             lines.append("Keep it OCR-adjacent: use the text as the reference for which object to describe, but ask about the object or surface itself.")
+            lines.append("If the anchor_label above contains text-content words (handwritten, printed, dates, initials, etc.), use only the plain object noun in the question — do not repeat those terms.")
             if anchor_disambiguation_required:
                 lines.append("The anchor repeats in the image. Use one added disambiguation cue, preferably color or a local anchor phrase.")
         blocks.append("\n".join(lines))
@@ -2524,6 +2543,7 @@ def build_batched_prompt(selected_candidates: list[dict[str, Any]]) -> str:
         + "Do not invent new text, objects, materials, activities, scene context, or semantic interpretations.\n"
         + "Do not paraphrase the anchor into a richer description than the allowed anchor phrases.\n"
         + "If the allowed anchor phrase is generic like sign, poster, label, board, screen, bottle, or box, use that exact noun instead of inventing a more specific object description.\n"
+        + "If the anchor_label contains words that reference text content — such as 'handwritten', 'printed', 'written', 'engraved', 'dates', 'initials', 'signatures', 'numbers', 'letters', 'text', 'inscription', or similar — strip those terms and use only the plain visual object noun (e.g., 'stack of books' not 'stack of books with handwritten dates', 'plaque' not 'plaque engraved letters'). Never copy text-content descriptors from the anchor_label into the generated question.\n"
         + "Do not use the image to guess subject matter such as medical notes, menus, therapy, music, sports, or brands unless that wording already appears in the verified text itself.\n"
         + strictness_instruction
         + "Do not ask questions that require reading two separate text regions, comparing multiple text regions, or using world knowledge.\n"

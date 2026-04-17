@@ -149,7 +149,7 @@ def build_source_universe(*, out_dir: Path, chartqa_count: int, textocr_count: i
     return manifest
 
 
-def _run_variant(
+def _build_variant_cmd(
     *,
     source_dir: Path,
     out_dir: Path,
@@ -162,20 +162,15 @@ def _run_variant(
     device: str,
     env_overrides: dict[str, str],
     cli_overrides: dict[str, str],
-) -> dict[str, Any]:
-    if (out_dir / "summary.json").exists() and (out_dir / "ocr_qa_dataset.jsonl").exists():
-        summary = json.loads((out_dir / "summary.json").read_text(encoding="utf-8"))
-        rows = [json.loads(line) for line in (out_dir / "ocr_qa_dataset.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()]
-        metrics = compute_run_quality(summary, rows)
-        return {"status": "cached", "metrics": metrics, "summary": summary}
-
+) -> tuple[list[str], dict[str, str]]:
+    """Build the subprocess cmd and env for a variant run. Shared by _run_variant and streaming runners."""
     env = os.environ.copy()
     env["PYTHONPATH"] = str(REPO_ROOT / "sgocr" / "src")
     env.update(env_overrides)
     cmd = [
         sys.executable,
         "-m",
-        "sgocr.dev200_harness",
+        "sgocr.scripts.dev200_harness",
         "build-dev40-semantic",
         "--source-experiment-dir",
         str(source_dir),
@@ -198,6 +193,42 @@ def _run_variant(
         cmd.extend(["--cache-intermediate-dir", str(cache_intermediate_dir)])
     for key, value in cli_overrides.items():
         cmd.extend([key, value])
+    return cmd, env
+
+
+def _run_variant(
+    *,
+    source_dir: Path,
+    out_dir: Path,
+    intermediate_dir: Path,
+    cache_intermediate_dir: Path | None,
+    cache_level: str,
+    model: str,
+    workers: int,
+    max_side: int,
+    device: str,
+    env_overrides: dict[str, str],
+    cli_overrides: dict[str, str],
+) -> dict[str, Any]:
+    if (out_dir / "summary.json").exists() and (out_dir / "ocr_qa_dataset.jsonl").exists():
+        summary = json.loads((out_dir / "summary.json").read_text(encoding="utf-8"))
+        rows = [json.loads(line) for line in (out_dir / "ocr_qa_dataset.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()]
+        metrics = compute_run_quality(summary, rows)
+        return {"status": "cached", "metrics": metrics, "summary": summary}
+
+    cmd, env = _build_variant_cmd(
+        source_dir=source_dir,
+        out_dir=out_dir,
+        intermediate_dir=intermediate_dir,
+        cache_intermediate_dir=cache_intermediate_dir,
+        cache_level=cache_level,
+        model=model,
+        workers=workers,
+        max_side=max_side,
+        device=device,
+        env_overrides=env_overrides,
+        cli_overrides=cli_overrides,
+    )
     proc = subprocess.run(
         cmd,
         cwd=str(REPO_ROOT),

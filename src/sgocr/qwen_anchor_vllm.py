@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -81,24 +82,140 @@ _ANTI_OCR_SUFFIX = (
 INDEPENDENT_QWEN_INVENTORY_PROMPT_ANTI_OCR = INDEPENDENT_QWEN_INVENTORY_PROMPT.rstrip(".") + "." + _ANTI_OCR_SUFFIX
 STRUCTURAL_FALLBACK_QWEN_PROMPT_ANTI_OCR = STRUCTURAL_FALLBACK_QWEN_PROMPT.rstrip(".") + _ANTI_OCR_SUFFIX
 
+# No-text-ref suffix: stronger than anti-OCR — forbids any reference to text content (not just
+# verbatim copies) and requires disambiguation when multiple anchors share the same label type.
+# Use this when anchor labels are leaking text content through paraphrase or partial quotes.
+_NO_TEXT_REF_SUFFIX = (
+    " Label each detected region using only visual descriptors: object type, shape, color, material, "
+    "or structural role. Never reference, quote, or paraphrase any text visible on or inside the region. "
+    "When multiple instances of the same object type appear, distinguish them with a color or position "
+    "qualifier, for example 'blue sign' vs 'red sign', or 'left panel' vs 'right panel'."
+)
+
+INDEPENDENT_QWEN_INVENTORY_PROMPT_NO_TEXT_REF = INDEPENDENT_QWEN_INVENTORY_PROMPT.rstrip(".") + "." + _NO_TEXT_REF_SUFFIX
+STRUCTURAL_FALLBACK_QWEN_PROMPT_NO_TEXT_REF = STRUCTURAL_FALLBACK_QWEN_PROMPT.rstrip(".") + _NO_TEXT_REF_SUFFIX
+
+# ITA15 prompt: self-contained rewrite for Qwen3-VL independent inventory.
+# Does NOT extend the no_text_ref category-list format — that format triggers
+# Qwen repetition loops when extended beyond ~185 tokens.  Instead this is a
+# standalone instruction-following prompt that avoids the category list entirely.
+#
+# Improvements over the original compressed draft:
+#   - Stronger "with" requirement (REQUIRED keyword + CORRECT/WRONG examples)
+#   - Chart consolidation: one box per logical region, not per tick mark
+#   - Size preference and chart fluff suppression retained
+INDEPENDENT_QWEN_INVENTORY_PROMPT_ITA15 = (
+    "Locate every visible object or surface that has text on or near it, or that could serve as a "
+    "spatial anchor for nearby text. Skip large featureless backgrounds that have no text nearby.\n"
+    "REQUIRED: always use the word 'with' between a subject and its color or descriptor. "
+    "CORRECT: 'player with red jersey', 'sign with blue background'. "
+    "WRONG: 'player red jersey', 'blue background sign'.\n"
+    "Use visual descriptors only — never quote, paraphrase, or reference any text visible in the image. "
+    "Distinguish same-type objects with color or position (e.g. 'sign with blue background' vs 'sign with red background').\n"
+    "For photos with people: label by role and appearance "
+    "(e.g. 'baseball player with red jersey', 'referee with black uniform') — not by jersey text or numbers.\n"
+    "For charts and infographics: draw one bounding box per logical region — do NOT draw many small "
+    "boxes for repeated elements of the same type. Prefer broad regions: 'bar chart plot area', "
+    "'y-axis region', 'legend area'. Skip copyright notices, watermarks, and decorative side panels.\n"
+    'Report as JSON: {{"bbox_2d": [x1, y1, x2, y2], "label": "description"}}'
+)
+
+# ITA15 structural fallback: chart/doc version of the above.
+STRUCTURAL_FALLBACK_QWEN_PROMPT_ITA15 = (
+    "Locate distinct bounded regions in this chart or document that contain or adjoin text: "
+    "bars, segments, cells, buttons, badges, axis areas, titles.\n"
+    "Draw one bounding box per logical region — do NOT draw many small boxes for repeated elements "
+    "of the same type (e.g. draw one 'y-axis region', not 9 separate axis-tick boxes).\n"
+    "REQUIRED: use 'with' to attach a color: 'bar with blue fill', NOT 'blue fill bar'.\n"
+    "Label by shape and structural role with color when useful "
+    "(e.g. 'bar with blue fill', 'gray legend area', 'axis label region'). "
+    "Never quote, paraphrase, or reference visible text. Distinguish same-type regions by color or position. "
+    "Skip copyright notices, watermarks, and decorative side panels.\n"
+    'Report as JSON: {{"bbox_2d": [x1, y1, x2, y2], "label": "description"}}'
+)
+
 # Per-anchor degenerate label set: labels that are too generic or abstract to anchor a useful QA.
 # These are individual-anchor checks (not whole-image inventory checks like _DEGENERATE_LABELS).
 _DEGENERATE_ANCHOR_LABELS: frozenset[str] = frozenset({
     "object part", "surface", "area", "region", "part", "section",
     "texture", "background", "element", "item", "thing", "object",
     "entity", "feature", "detail", "structure", "view", "content",
+    # Mislabels that arise when Qwen sees text/numbers on clothing or equipment
+    "document", "printed page", "page", "text document", "printed document",
+    # Pure background single-word labels
+    "sky", "ceiling", "pavement", "sidewalk",
 }) | _DEGENERATE_LABELS
+
+# Words that, when they appear as the trailing token of a multi-word compound label,
+# indicate it is a pure background region with no text-anchoring value.
+# e.g. "light blue sky", "overcast sky", "white ceiling"
+_BACKGROUND_TRAILING_WORDS: frozenset[str] = frozenset({"sky", "ceiling", "pavement", "sidewalk"})
 
 
 def is_degenerate_anchor_label(label: str) -> bool:
     """Return True if a single anchor label is too generic to anchor a useful QA.
 
-    Catches labels like 'object part', 'surface', 'area', 'unknown', '' etc.
+    Catches:
+    - Exact-match generic labels: 'object part', 'surface', 'area', etc.
+    - Compound labels ending in pure-background terms: 'light blue sky', 'white ceiling'
     """
     norm = str(label or "").strip().lower()
     if len(norm) <= 2:
         return True
-    return norm in _DEGENERATE_ANCHOR_LABELS
+    if norm in _DEGENERATE_ANCHOR_LABELS:
+        return True
+    words = norm.split()
+    if len(words) >= 2 and words[-1] in _BACKGROUND_TRAILING_WORDS:
+        return True
+    return False
+
+
+# Words that, when they appear as the trailing token of a multi-word anchor label,
+# indicate the label is describing text content rather than a visual object.
+# Examples: "x-axis region date labels" → labels; "footer area text" → text
+# These arise from Gemma4 appending the text role of a region to its structural label.
+_TEXT_REF_TRAILING_WORDS: frozenset[str] = frozenset({
+    "labels", "caption", "footnote", "footnotes", "watermark", "text",
+})
+
+# Substrings that indicate the label references visible text content rather than a
+# visual object regardless of position. "printed text", "visible text", etc.
+_TEXT_CONTENT_SUBSTRINGS: tuple[str, ...] = ("printed text", "visible text", "written text")
+
+# Prefixes that indicate the anchor is fundamentally a text-content descriptor
+# rather than a visual object. e.g. "text block black text", "text area small print"
+_TEXT_CONTENT_PREFIXES: tuple[str, ...] = ("text block", "text area")
+
+
+def is_text_ref_anchor_label(label: str) -> bool:
+    """Return True if an anchor label references visible text content rather than a visual object.
+
+    Catches compound labels where a model appends the text role of a region:
+      - "x-axis region date labels"  (trailing 'labels')
+      - "footer area text"           (trailing 'text')
+      - "text block black text"      (prefix 'text block')
+      - "text area small print"      (prefix 'text area')
+      - "stack rectangular plaques printed text"  (substring 'printed text')
+
+    These labels leak text content through the anchor name, undermining image-dependence.
+    Intended to be used as an additional gate alongside is_degenerate_anchor_label().
+    """
+    norm = str(label or "").strip().lower()
+    if not norm:
+        return False
+    words = norm.split()
+    # trailing text-role word in a multi-word label
+    if len(words) >= 2 and words[-1] in _TEXT_REF_TRAILING_WORDS:
+        return True
+    # label contains a text-content substring
+    for sub in _TEXT_CONTENT_SUBSTRINGS:
+        if sub in norm:
+            return True
+    # label is primarily a text-content descriptor (prefix check)
+    for prefix in _TEXT_CONTENT_PREFIXES:
+        if norm.startswith(prefix):
+            return True
+    return False
 
 
 def is_ocr_text_label(label: str) -> bool:
@@ -212,6 +329,39 @@ class _StageProgressLogger:
         elapsed = max(time.time() - self._start, 1e-6)
         suffix = f" {extra}" if extra else ""
         self._emit(f"finish completed={self.total}/{self.total} pct=100% elapsed_s={elapsed:.1f}{suffix}")
+
+
+def _wait_for_gpu_memory(min_free_mib: int = 10_000, poll_interval_s: int = 30, timeout_s: int = 600) -> None:
+    """Block until nvidia-smi reports >= min_free_mib MiB free on GPU 0.
+
+    Ollama releases VRAM within ~5 minutes of `ollama stop`. This loop avoids an
+    immediate OOM from vLLM startup racing a still-loaded Ollama model.
+    """
+    deadline = time.time() + timeout_s
+    while True:
+        try:
+            raw = subprocess.check_output(
+                ["nvidia-smi", "--query-gpu=memory.free", "--format=csv,noheader,nounits"],
+                text=True,
+                timeout=10,
+            )
+            free_mib = int(raw.strip().splitlines()[0].strip())
+        except Exception:
+            return  # no nvidia-smi → not a GPU machine, proceed
+        if free_mib >= min_free_mib:
+            print(f"[vllm_startup] GPU free memory: {free_mib} MiB — OK", flush=True)
+            return
+        remaining = max(0, int(deadline - time.time()))
+        print(
+            f"[vllm_startup] GPU free memory: {free_mib} MiB < {min_free_mib} MiB required. "
+            f"Waiting {poll_interval_s}s (timeout in {remaining}s) — is Ollama still holding VRAM? "
+            f"Run: ollama stop gemma4:e4b-it-q4_K_M",
+            flush=True,
+        )
+        if time.time() >= deadline:
+            print(f"[vllm_startup] WARNING: GPU memory still low after {timeout_s}s — proceeding anyway", flush=True)
+            return
+        time.sleep(poll_interval_s)
 
 
 def _lazy_import_vllm() -> tuple[Any, Any, Any, Any]:
@@ -406,6 +556,7 @@ class QwenAnchorGrounderVLLM:
         max_pixels: int = 9800 * 32 * 32,
         max_model_len: int = 2048,
     ) -> None:
+        _wait_for_gpu_memory()
         process_vision_info, AutoProcessor, LLM, SamplingParams = _lazy_import_vllm()
         self._process_vision_info = process_vision_info
         self._SamplingParams = SamplingParams

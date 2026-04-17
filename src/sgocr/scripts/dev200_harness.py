@@ -17,6 +17,7 @@ from .dev200_eval import (
 from ..dev40_complete import build_dev40_complete_dataset
 from ..full_pipeline_dev40 import build_dev40_semantic_dataset
 from ..paths import OCR_SPATIAL_QA_FINAL_ROOT, OCR_SPATIAL_QA_INTERMEDIATE_ROOT, OCR_SPATIAL_QA_RAW_ROOT
+from ..secrets import GEMINI, missing_secret_env_vars
 from ..teacher.bakeoff import ExperimentSpec, run_experiment
 
 
@@ -156,6 +157,14 @@ def main() -> None:
             target_per_image=int(args.target_per_image),
         )
         return
+
+    if args.cmd in {"build-dev40-semantic", "build-dev40-complete"}:
+        missing = missing_secret_env_vars([GEMINI])
+        if missing:
+            raise SystemExit(
+                f"[startup] FATAL: missing required env vars: {missing}\n"
+                "Set GEMINI_API_KEY before running the pipeline."
+            )
 
     if args.cmd == "build-dev40-semantic":
         out_dir = (

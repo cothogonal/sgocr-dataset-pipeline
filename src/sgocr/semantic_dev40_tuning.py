@@ -69,6 +69,7 @@ class SemanticDev40Tuning:
     yesno_negative_specific_threshold: int = 2
     yesno_positive_specific_threshold: int = 3
     property_specific_threshold: int = 4
+    anchor_property_specific_threshold: int = 3
     max_negative_yesno_per_image: int = 1
     anchor_type_soft_cap_count: int = 2
     anchor_type_soft_cap_penalty: float = 0.15
@@ -112,7 +113,10 @@ class SemanticDev40Tuning:
     qwen_degenerate_label_threshold: float = 0.92
     qwen_min_anchor_detections_per_image: int = 0
     qwen_anti_ocr_prompt_enabled: bool = False
+    qwen_no_text_ref_prompt_enabled: bool = False
+    qwen_ita15_prompt_enabled: bool = False
     qwen_degenerate_anchor_filter_enabled: bool = False
+    anchor_text_ref_label_filter_enabled: bool = False
     rg_structural_anchor_filter_enabled: bool = False
     upstream_centroid_filter_enabled: bool = False
     inline_frontier_gate_enabled: bool = False
@@ -137,6 +141,9 @@ class SemanticDev40Tuning:
     qwen_anchor_min_pixels: int = 64 * 32 * 32
     qwen_anchor_max_pixels: int = 9800 * 32 * 32
     qwen_anchor_max_model_len: int = 2048
+    gemma_ollama_model: str = "gemma4:e4b-it-q4_K_M"
+    gemma_ollama_base_url: str = "http://localhost:11434"
+    gemma_ollama_num_ctx: int = 4096
     gemini_api_mode: str = "sync"
     gemini_batch_chunk_size: int = 48
     gemini_batch_poll_seconds: int = 15
@@ -190,6 +197,7 @@ def load_semantic_dev40_tuning() -> SemanticDev40Tuning:
         yesno_negative_specific_threshold=_env_int("SGOCR_YESNO_NEGATIVE_SPECIFIC_THRESHOLD", 2),
         yesno_positive_specific_threshold=_env_int("SGOCR_YESNO_POSITIVE_SPECIFIC_THRESHOLD", 3),
         property_specific_threshold=_env_int("SGOCR_PROPERTY_SPECIFIC_THRESHOLD", 4),
+        anchor_property_specific_threshold=_env_int("SGOCR_ANCHOR_PROPERTY_SPECIFIC_THRESHOLD", 3),
         max_negative_yesno_per_image=_env_int("SGOCR_MAX_NEGATIVE_YESNO_PER_IMAGE", 1),
         anchor_type_soft_cap_count=_env_int("SGOCR_ANCHOR_TYPE_SOFT_CAP_COUNT", 2),
         anchor_type_soft_cap_penalty=_env_float("SGOCR_ANCHOR_TYPE_SOFT_CAP_PENALTY", 0.15),
@@ -233,7 +241,10 @@ def load_semantic_dev40_tuning() -> SemanticDev40Tuning:
         qwen_degenerate_label_threshold=_env_float("SGOCR_QWEN_DEGENERATE_LABEL_THRESHOLD", 0.92),
         qwen_min_anchor_detections_per_image=_env_int("SGOCR_QWEN_MIN_ANCHOR_DETECTIONS_PER_IMAGE", 0),
         qwen_anti_ocr_prompt_enabled=_env_int("SGOCR_QWEN_ANTI_OCR_PROMPT_ENABLED", 0) != 0,
+        qwen_no_text_ref_prompt_enabled=_env_int("SGOCR_QWEN_NO_TEXT_REF_PROMPT_ENABLED", 0) != 0,
+        qwen_ita15_prompt_enabled=_env_int("SGOCR_QWEN_ITA15_PROMPT_ENABLED", 0) != 0,
         qwen_degenerate_anchor_filter_enabled=_env_int("SGOCR_QWEN_DEGENERATE_ANCHOR_FILTER_ENABLED", 0) != 0,
+        anchor_text_ref_label_filter_enabled=_env_int("SGOCR_ANCHOR_TEXT_REF_LABEL_FILTER_ENABLED", 0) != 0,
         rg_structural_anchor_filter_enabled=_env_int("SGOCR_RG_STRUCTURAL_ANCHOR_FILTER_ENABLED", 0) != 0,
         upstream_centroid_filter_enabled=_env_int("SGOCR_UPSTREAM_CENTROID_FILTER_ENABLED", 0) != 0,
         inline_frontier_gate_enabled=_env_int("SGOCR_INLINE_FRONTIER_GATE_ENABLED", 0) != 0,
@@ -258,6 +269,9 @@ def load_semantic_dev40_tuning() -> SemanticDev40Tuning:
         qwen_anchor_min_pixels=_env_int("SGOCR_QWEN_ANCHOR_MIN_PIXELS", 64 * 32 * 32),
         qwen_anchor_max_pixels=_env_int("SGOCR_QWEN_ANCHOR_MAX_PIXELS", 9800 * 32 * 32),
         qwen_anchor_max_model_len=_env_int("SGOCR_QWEN_ANCHOR_MAX_MODEL_LEN", 2048),
+        gemma_ollama_model=_env_str("SGOCR_GEMMA_OLLAMA_MODEL", "gemma4:e4b-it-q4_K_M"),
+        gemma_ollama_base_url=_env_str("SGOCR_GEMMA_OLLAMA_BASE_URL", "http://localhost:11434"),
+        gemma_ollama_num_ctx=_env_int("SGOCR_GEMMA_OLLAMA_NUM_CTX", 4096),
         gemini_api_mode=_env_str("SGOCR_GEMINI_API_MODE", "sync"),
         gemini_batch_chunk_size=_env_int("SGOCR_GEMINI_BATCH_CHUNK_SIZE", 48),
         gemini_batch_poll_seconds=_env_int("SGOCR_GEMINI_BATCH_POLL_SECONDS", 15),
@@ -271,7 +285,7 @@ def load_semantic_dev40_tuning() -> SemanticDev40Tuning:
         raise ValueError(
             f"Unsupported SGOCR_QWEN_ANCHOR_TAG_DISCOVERY_VOCAB_MODE: {tuning.qwen_anchor_tag_discovery_vocab_mode}"
         )
-    if tuning.anchor_candidate_backend not in {"florence_dino", "qwen3_vl_vllm"}:
+    if tuning.anchor_candidate_backend not in {"florence_dino", "qwen3_vl_vllm", "gemma4_ollama"}:
         raise ValueError(f"Unsupported SGOCR_ANCHOR_CANDIDATE_BACKEND: {tuning.anchor_candidate_backend}")
     if tuning.qwen_anchor_inventory_mode not in {"selected_tags", "global_inventory", "independent_raw"}:
         raise ValueError(f"Unsupported SGOCR_QWEN_ANCHOR_INVENTORY_MODE: {tuning.qwen_anchor_inventory_mode}")
@@ -357,6 +371,8 @@ def load_semantic_dev40_tuning() -> SemanticDev40Tuning:
         raise ValueError("SGOCR_REVERSE_GROUND_DIRECTIONAL_MIXED_BIAS must be in [0,1]")
     if not 0.0 <= tuning.reverse_ground_on_mixed_bias <= 1.0:
         raise ValueError("SGOCR_REVERSE_GROUND_ON_MIXED_BIAS must be in [0,1]")
+    if tuning.anchor_property_specific_threshold < 0:
+        raise ValueError("SGOCR_ANCHOR_PROPERTY_SPECIFIC_THRESHOLD must be >= 0")
     if tuning.ambiguity_hard_reject_score < 0 or tuning.ambiguity_reverse_reject_score < 0:
         raise ValueError("Ambiguity reject scores must be >= 0")
     if not 0.0 <= tuning.anchor_conflict_overlap <= 1.0:

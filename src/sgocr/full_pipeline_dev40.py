@@ -28,15 +28,25 @@ from .dev40_complete import (
 )
 from .ocr_runtime import CraftDetector, PARSeqRecognizer, PaddleOCRDetector, PaddleOCRRecognizer, TrOCRRecognizer, bbox_to_polygon, crop_with_padding
 from .nemotron_frontend import run_nemotron_ocr_stage
+from .ollama_anchor import (
+    GEMMA_INDEPENDENT_INVENTORY_PROMPT_ITA15,
+    GEMMA_INDEPENDENT_INVENTORY_PROMPT_ITA16_ANTIDOC,
+    GEMMA_INDEPENDENT_INVENTORY_PROMPT_ITA16_COMPACT,
+    GEMMA_STRUCTURAL_FALLBACK_PROMPT_ITA15,
+    GemmaOllamaAnchorGrounder,
+)
 from .qwen_anchor_vllm import (
     INDEPENDENT_QWEN_INVENTORY_PROMPT,
     INDEPENDENT_QWEN_INVENTORY_PROMPT_ANTI_OCR,
+    INDEPENDENT_QWEN_INVENTORY_PROMPT_NO_TEXT_REF,
+    INDEPENDENT_QWEN_INVENTORY_PROMPT_ITA15,
     OPEN_QWEN_LOCAL_DISCOVERY_PROMPT,
     OPEN_QWEN_LOCAL_DISCOVERY_PROMPT_COLOR_SPECIFIC,
     QwenAnchorGrounderVLLM,
     QwenAnchorRequest,
     is_degenerate_anchor_label,
     is_ocr_text_label,
+    is_text_ref_anchor_label,
     merge_qwen_inventory_passes,
     normalize_qwen_description,
 )
@@ -568,14 +578,43 @@ def _is_valid_merged_answer(answer: str, *, node_count: int) -> bool:
 
 
 def _order_component_nodes(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    orientation = _component_orientation(nodes)
-    def x_then_y(row: dict[str, Any]) -> tuple[float, float]:
-        cx, cy = _box_center(list(row["bbox"]))
-        return (cx, cy)
+    """Order component nodes in natural reading order (left-to-right, top-to-bottom).
 
-    if orientation in {"horizontal", "mixed"}:
-        return sorted(nodes, key=x_then_y)
-    return sorted(nodes, key=lambda row: (_box_center(list(row["bbox"]))[1], _box_center(list(row["bbox"]))[0]))
+    Groups nodes into horizontal rows by y-centroid proximity (tolerance = 0.6 × median
+    node height), then sorts left-to-right within each row. This correctly handles:
+    - Inline words on a single line (same row → x-sort)
+    - Stacked words on a sign (each word in its own row → y-sort)
+    - Mixed layouts (multi-line text blocks)
+
+    Replaces the previous orientation-class approach, which misclassified some vertical
+    stacks as 'mixed' and applied an x-first sort that scrambled reading order.
+    """
+    if len(nodes) <= 1:
+        return list(nodes)
+
+    heights = sorted(_box_height(list(n["bbox"])) for n in nodes)
+    median_h = heights[len(heights) // 2]
+    row_tolerance = max(median_h * 0.6, 2.0)
+
+    by_y = sorted(nodes, key=lambda n: (_box_center(list(n["bbox"]))[1], _box_center(list(n["bbox"]))[0]))
+
+    rows: list[list[dict[str, Any]]] = []
+    for node in by_y:
+        cy = _box_center(list(node["bbox"]))[1]
+        placed = False
+        for row in rows:
+            row_mean_y = sum(_box_center(list(n["bbox"]))[1] for n in row) / len(row)
+            if abs(cy - row_mean_y) <= row_tolerance:
+                row.append(node)
+                placed = True
+                break
+        if not placed:
+            rows.append([node])
+
+    result: list[dict[str, Any]] = []
+    for row in rows:
+        result.extend(sorted(row, key=lambda n: _box_center(list(n["bbox"]))[0]))
+    return result
 
 
 def build_merged_sign_tuples_for_image(
@@ -829,6 +868,8 @@ def build_dev40_semantic_dataset(
     runtime_models["qwen_anchor_inventory_min_support"] = tuning.qwen_anchor_inventory_min_support
     if tuning.anchor_candidate_backend == "qwen3_vl_vllm" or tuning.anchor_tag_discovery_backend == "qwen3_vl_vllm":
         runtime_models["grounder"] = tuning.qwen_anchor_model
+    elif tuning.anchor_candidate_backend == "gemma4_ollama":
+        runtime_models["grounder"] = f"gemma4_ollama:{tuning.gemma_ollama_model}"
     if tuning.sam3_refine_mode != "none":
         runtime_models["sam3_refiner"] = "facebook/sam3"
     image_specs, image_source_map = load_image_specs(source_experiment_dir)
@@ -1555,6 +1596,14 @@ def build_resolvability_stats(nodes: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _gemma_prompt_for_variant(variant: str) -> str:
+    if variant == "antidoc":
+        return GEMMA_INDEPENDENT_INVENTORY_PROMPT_ITA16_ANTIDOC
+    if variant == "compact":
+        return GEMMA_INDEPENDENT_INVENTORY_PROMPT_ITA16_COMPACT
+    return GEMMA_INDEPENDENT_INVENTORY_PROMPT_ITA15
+
+
 def run_anchor_stage(
     *,
     image_specs: list[dict[str, str]],
@@ -1566,9 +1615,10 @@ def run_anchor_stage(
     tuning = load_semantic_dev40_tuning()
     use_qwen_tag_backend = tuning.anchor_tag_discovery_backend == "qwen3_vl_vllm"
     use_qwen_anchor_backend = tuning.anchor_candidate_backend == "qwen3_vl_vllm"
-    use_independent_qwen_inventory = use_qwen_anchor_backend and tuning.qwen_anchor_inventory_mode == "independent_raw"
+    use_gemma_anchor_backend = tuning.anchor_candidate_backend == "gemma4_ollama"
+    use_independent_qwen_inventory = (use_qwen_anchor_backend or use_gemma_anchor_backend) and tuning.qwen_anchor_inventory_mode == "independent_raw"
     tagger = None if use_qwen_tag_backend or use_independent_qwen_inventory else FlorenceTagger(model_name=str(RUNTIME_MODELS["semantic_tagger"]), device=device)
-    grounder = None if use_qwen_anchor_backend else GroundingDinoGrounder(device=device)
+    grounder = None if (use_qwen_anchor_backend or use_gemma_anchor_backend) else GroundingDinoGrounder(device=device)
     qwen_grounder = (
         QwenAnchorGrounderVLLM(
             model_name=str(tuning.qwen_anchor_model),
@@ -1579,6 +1629,12 @@ def run_anchor_stage(
             max_model_len=int(tuning.qwen_anchor_max_model_len),
         )
         if use_qwen_anchor_backend or use_qwen_tag_backend
+        else GemmaOllamaAnchorGrounder(
+            model=str(tuning.gemma_ollama_model),
+            base_url=str(tuning.gemma_ollama_base_url),
+            num_ctx=int(tuning.gemma_ollama_num_ctx),
+        )
+        if use_gemma_anchor_backend
         else None
     )
     sam3_refiner = Sam3Refiner(device=device, confidence_threshold=tuning.sam3_confidence_threshold) if _sam3_prompt_limit() > 0 else None
@@ -1631,8 +1687,18 @@ def run_anchor_stage(
                     "per_node_tags": per_node_tags,
                     "per_node_local_candidates": per_node_local_candidates,
                     "independent_inventory_prompt": (
-                        INDEPENDENT_QWEN_INVENTORY_PROMPT_ANTI_OCR
+                        _gemma_prompt_for_variant(os.environ.get("SGOCR_GEMMA_ITA16_PROMPT_VARIANT", ""))
+                        if use_gemma_anchor_backend and os.environ.get("SGOCR_GEMMA_ITA16_PROMPT_VARIANT", "")
+                        else GEMMA_INDEPENDENT_INVENTORY_PROMPT_ITA15
+                        if use_gemma_anchor_backend and tuning.qwen_ita15_prompt_enabled
+                        else INDEPENDENT_QWEN_INVENTORY_PROMPT_ITA15
+                        if tuning.qwen_ita15_prompt_enabled
+                        else INDEPENDENT_QWEN_INVENTORY_PROMPT_NO_TEXT_REF
+                        if tuning.qwen_no_text_ref_prompt_enabled
+                        else INDEPENDENT_QWEN_INVENTORY_PROMPT_ANTI_OCR
                         if tuning.qwen_anti_ocr_prompt_enabled
+                        else GEMMA_INDEPENDENT_INVENTORY_PROMPT_ITA15
+                        if use_gemma_anchor_backend
                         else INDEPENDENT_QWEN_INVENTORY_PROMPT
                     ),
                 }
@@ -1795,10 +1861,18 @@ def run_anchor_stage(
 
             # --- Structural fallback for degenerate inventory results ---
             if tuning.qwen_structural_fallback_enabled:
-                from .qwen_anchor_vllm import STRUCTURAL_FALLBACK_QWEN_PROMPT, STRUCTURAL_FALLBACK_QWEN_PROMPT_ANTI_OCR, is_degenerate_inventory
+                from .qwen_anchor_vllm import STRUCTURAL_FALLBACK_QWEN_PROMPT, STRUCTURAL_FALLBACK_QWEN_PROMPT_ANTI_OCR, STRUCTURAL_FALLBACK_QWEN_PROMPT_NO_TEXT_REF, STRUCTURAL_FALLBACK_QWEN_PROMPT_ITA15, is_degenerate_inventory
                 _structural_fallback_prompt = (
-                    STRUCTURAL_FALLBACK_QWEN_PROMPT_ANTI_OCR
+                    GEMMA_STRUCTURAL_FALLBACK_PROMPT_ITA15
+                    if use_gemma_anchor_backend and tuning.qwen_ita15_prompt_enabled
+                    else STRUCTURAL_FALLBACK_QWEN_PROMPT_ITA15
+                    if tuning.qwen_ita15_prompt_enabled
+                    else STRUCTURAL_FALLBACK_QWEN_PROMPT_NO_TEXT_REF
+                    if tuning.qwen_no_text_ref_prompt_enabled
+                    else STRUCTURAL_FALLBACK_QWEN_PROMPT_ANTI_OCR
                     if tuning.qwen_anti_ocr_prompt_enabled
+                    else GEMMA_STRUCTURAL_FALLBACK_PROMPT_ITA15
+                    if use_gemma_anchor_backend
                     else STRUCTURAL_FALLBACK_QWEN_PROMPT
                 )
                 degenerate_ids = {
@@ -1913,6 +1987,23 @@ def run_anchor_stage(
             total_filtered += len(before) - len(after)
             image_anchors_by_image[image_id] = after
         print(f"[degenerate_anchor_filter] removed={total_filtered} anchors", flush=True)
+
+    # --- Text-reference anchor label filter ---
+    # Removes anchors whose labels reference visible text content rather than describing
+    # a visual object. Catches Gemma4 compound labels like "x-axis region date labels"
+    # (trailing 'labels') or "text block black text" (text-content prefix).
+    # These labels leak answer content through the anchor name, harming image-dependence.
+    if tuning.anchor_text_ref_label_filter_enabled:
+        total_filtered = 0
+        for image_id in list(image_anchors_by_image.keys()):
+            before = image_anchors_by_image[image_id]
+            after = [
+                row for row in before
+                if not is_text_ref_anchor_label(str(row.get("label") or ""))
+            ]
+            total_filtered += len(before) - len(after)
+            image_anchors_by_image[image_id] = after
+        print(f"[text_ref_anchor_filter] removed={total_filtered} anchors", flush=True)
 
     # --- Anchor label groundback check ---
     # Re-runs Qwen with only the anchor label text to verify the label uniquely identifies
