@@ -134,6 +134,36 @@ STRUCTURAL_FALLBACK_QWEN_PROMPT_ITA15 = (
     'Report as JSON: {{"bbox_2d": [x1, y1, x2, y2], "label": "description"}}'
 )
 
+# DAM01 prompt: tuned for hybrid rescue runs where Qwen is only invoked on images
+# that Gemma failed to cover well. The label instruction explicitly favors physical
+# objects and surfaces whose appearance supports anchor-property questions.
+INDEPENDENT_QWEN_INVENTORY_PROMPT_DAM01 = (
+    "Locate every visible object or surface that has text on or near it, or that could serve as a "
+    "visually discriminative anchor for nearby text.\n"
+    "Prefer labels that preserve visible properties such as material, shape, color, or physical surface "
+    "type, for example 'metal sign with red border', 'paper label with blue fill', 'fabric jersey with white trim', "
+    "'bar chart plot area', or 'legend panel'.\n"
+    "REQUIRED: always use the word 'with' between the subject and any color or descriptor. "
+    "CORRECT: 'sign with blue background', 'player with red jersey'. "
+    "WRONG: 'blue background sign', 'player red jersey'.\n"
+    "Use visual descriptors only. Never quote, paraphrase, or reference any visible text in a label. "
+    "When multiple anchors share the same object type, distinguish them by color, material, or position.\n"
+    "For charts and infographics: draw one bounding box per logical region, not many tiny boxes for repeated marks. "
+    "Prefer broad regions such as 'bar chart plot area', 'y-axis region', 'legend area', and skip decorative side panels, "
+    "copyright notices, and watermarks.\n"
+    'Report as JSON: {{"bbox_2d": [x1, y1, x2, y2], "label": "description"}}'
+)
+
+STRUCTURAL_FALLBACK_QWEN_PROMPT_DAM01 = (
+    "Locate distinct bounded regions in this chart, document, sign, or product scene that contain or closely adjoin text.\n"
+    "Prefer labels that preserve visible structure or material, such as 'metal nameplate', 'paper flyer', 'plastic button', "
+    "'legend panel', 'axis label region', or 'bar with blue fill'.\n"
+    "REQUIRED: use 'with' to attach colors or visual modifiers. "
+    "Never quote, paraphrase, or reference visible text. Distinguish same-type regions by color or position.\n"
+    "Draw one bounding box per logical region rather than many tiny repeated boxes.\n"
+    'Report as JSON: {{"bbox_2d": [x1, y1, x2, y2], "label": "description"}}'
+)
+
 # Per-anchor degenerate label set: labels that are too generic or abstract to anchor a useful QA.
 # These are individual-anchor checks (not whole-image inventory checks like _DEGENERATE_LABELS).
 _DEGENERATE_ANCHOR_LABELS: frozenset[str] = frozenset({

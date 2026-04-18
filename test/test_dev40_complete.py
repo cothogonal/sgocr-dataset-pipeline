@@ -8,7 +8,10 @@ from sgocr.bootstrap_kd import bootstrap_anchor_boxes, compute_resolvability
 from sgocr.dev40_complete import (
     _anchor_centroid_offset,
     apply_answer_probe_policy,
+    build_batched_prompt,
     _unique_anchor_can_skip_global_location,
+    candidate_anchor_label,
+    candidate_anchor_phrases,
     candidate_anchor_local_phrase,
     candidate_anchor_local_synonyms,
     candidate_has_answer_leakage,
@@ -940,6 +943,53 @@ class TestDev40Complete(unittest.TestCase):
         self.assertTrue(validation["accepted"])
         self.assertEqual(summary["accepted_count"], 1)
         self.assertIsNone(failure)
+
+    def test_rg_anchor_phrase_scrubs_color_when_enabled(self) -> None:
+        candidate = {
+            "question_type": "REVERSE_GROUND",
+            "query_anchor_label": "blue sign",
+            "query_anchor_synonyms": ["blue sign", "the blue sign"],
+            "tuple": {
+                "anchor_label": "blue sign",
+                "anchor_synonyms": ["blue sign"],
+            },
+        }
+        with patch.dict(os.environ, {"SGOCR_RG_SCRUB_COLOR_ANCHOR_PHRASES_ENABLED": "1"}, clear=True):
+            self.assertEqual(candidate_anchor_label(candidate), "sign")
+            self.assertEqual(candidate_anchor_phrases(candidate), ["sign", "the sign"])
+
+    def test_text_property_prompt_uses_location_first_wording_when_enabled(self) -> None:
+        candidate = self._make_rescued_specific_location_candidate(question_type="TEXT_PROPERTY", answer="PIZZA")
+        candidate["text_property_type"] = "text_color"
+        candidate["query_text_reference"] = "PIZZA"
+        with patch.dict(
+            os.environ,
+            {"SGOCR_TP_VISUAL_AVOID_TEXT_REFERENCE_WITH_SPECIFIC_LOCATION_ENABLED": "1"},
+            clear=True,
+        ):
+            prompt = build_batched_prompt([candidate])
+        self.assertIn("visible color of the target text at this location", prompt)
+        self.assertNotIn('that says "PIZZA"', prompt)
+
+    def test_text_property_high_prior_answer_filter_rejects_generic_anchor(self) -> None:
+        candidate = self._make_rescued_specific_location_candidate(question_type="TEXT_PROPERTY", answer="PIZZA")
+        candidate["text_property_type"] = "text_color"
+        candidate["query_anchor_label"] = "panel"
+        candidate["query_anchor_synonyms"] = ["panel"]
+        candidate["tuple"]["anchor_label"] = "panel"
+        candidate["tuple"]["anchor_synonyms"] = ["panel"]
+        candidate["query_location_required"] = False
+        item = {
+            "candidate_index": 1,
+            "question_type": "TEXT_PROPERTY",
+            "question": "What color is the text on the panel?",
+            "answer": "white",
+        }
+        with patch.dict(os.environ, {"SGOCR_TP_VISUAL_HIGH_PRIOR_ANSWER_FILTER_ENABLED": "1"}, clear=True):
+            validation, summary, failure = validate_candidate_output(candidate, item)
+        self.assertFalse(validation["accepted"])
+        self.assertEqual(summary["accepted_count"], 0)
+        self.assertEqual(failure, "text_property_prior_leaky")
 
     def test_yesno_negative_uses_grounded_exclusion_location(self) -> None:
         tuple_row = {

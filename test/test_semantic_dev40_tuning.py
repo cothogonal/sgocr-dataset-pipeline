@@ -36,6 +36,12 @@ class TestSemanticDev40Tuning(unittest.TestCase):
         self.assertEqual(tuning.repeated_anchor_group_min_instances, 3)
         self.assertFalse(tuning.cheap_ambiguity_proxy_enabled)
         self.assertEqual(tuning.cheap_ambiguity_proxy_reject_score, 6)
+        self.assertFalse(tuning.tp_visual_avoid_text_reference_with_specific_location_enabled)
+        self.assertFalse(tuning.tp_visual_high_prior_answer_filter_enabled)
+        self.assertFalse(tuning.rg_scrub_color_anchor_phrases_enabled)
+        self.assertEqual(tuning.direct_read_selection_bonus, 0.25)
+        self.assertEqual(tuning.dr_generic_anchor_penalty, 0.0)
+        self.assertEqual(tuning.dr_same_anchor_repeat_penalty, 0.0)
         self.assertEqual(tuning.qwen_open_tag_prompt_mode, "basic")
         self.assertEqual(tuning.teacher_answer_probe_count, 1)
         self.assertEqual(tuning.teacher_answer_probe_temperature, 0.35)
@@ -81,6 +87,12 @@ class TestSemanticDev40Tuning(unittest.TestCase):
                 "SGOCR_REPEATED_ANCHOR_GROUP_MIN_INSTANCES": "4",
                 "SGOCR_CHEAP_AMBIGUITY_PROXY_ENABLED": "1",
                 "SGOCR_CHEAP_AMBIGUITY_PROXY_REJECT_SCORE": "8",
+                "SGOCR_TP_VISUAL_AVOID_TEXT_REFERENCE_WITH_SPECIFIC_LOCATION_ENABLED": "1",
+                "SGOCR_TP_VISUAL_HIGH_PRIOR_ANSWER_FILTER_ENABLED": "1",
+                "SGOCR_RG_SCRUB_COLOR_ANCHOR_PHRASES_ENABLED": "1",
+                "SGOCR_DIRECT_READ_SELECTION_BONUS": "0.05",
+                "SGOCR_DR_GENERIC_ANCHOR_PENALTY": "0.2",
+                "SGOCR_DR_SAME_ANCHOR_REPEAT_PENALTY": "0.15",
                 "SGOCR_QWEN_OPEN_TAG_PROMPT_MODE": "color_specific",
                 "SGOCR_TEACHER_ANSWER_PROBE_COUNT": "3",
                 "SGOCR_TEACHER_ANSWER_PROBE_TEMPERATURE": "0.55",
@@ -125,6 +137,12 @@ class TestSemanticDev40Tuning(unittest.TestCase):
         self.assertEqual(tuning.repeated_anchor_group_min_instances, 4)
         self.assertTrue(tuning.cheap_ambiguity_proxy_enabled)
         self.assertEqual(tuning.cheap_ambiguity_proxy_reject_score, 8)
+        self.assertTrue(tuning.tp_visual_avoid_text_reference_with_specific_location_enabled)
+        self.assertTrue(tuning.tp_visual_high_prior_answer_filter_enabled)
+        self.assertTrue(tuning.rg_scrub_color_anchor_phrases_enabled)
+        self.assertEqual(tuning.direct_read_selection_bonus, 0.05)
+        self.assertEqual(tuning.dr_generic_anchor_penalty, 0.2)
+        self.assertEqual(tuning.dr_same_anchor_repeat_penalty, 0.15)
         self.assertEqual(tuning.qwen_open_tag_prompt_mode, "color_specific")
         self.assertEqual(tuning.teacher_answer_probe_count, 3)
         self.assertEqual(tuning.teacher_answer_probe_temperature, 0.55)

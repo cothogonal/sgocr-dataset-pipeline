@@ -71,6 +71,10 @@ class SemanticDev40Tuning:
     property_specific_threshold: int = 4
     anchor_property_specific_threshold: int = 3
     max_negative_yesno_per_image: int = 1
+    max_yesno_per_image: int = -1  # -1 = unlimited; set to e.g. 2 to cap total YES_NO per image
+    tp_visual_only_enabled: bool = False  # when True, restricts TEXT_PROPERTY to text_color/text_curvature (visual types only)
+    tp_visual_avoid_text_reference_with_specific_location_enabled: bool = False
+    tp_visual_high_prior_answer_filter_enabled: bool = False
     anchor_type_soft_cap_count: int = 2
     anchor_type_soft_cap_penalty: float = 0.15
     reverse_ground_directional_local_bias: float = 0.20
@@ -115,6 +119,7 @@ class SemanticDev40Tuning:
     qwen_anti_ocr_prompt_enabled: bool = False
     qwen_no_text_ref_prompt_enabled: bool = False
     qwen_ita15_prompt_enabled: bool = False
+    qwen_dam01_prompt_enabled: bool = False
     qwen_degenerate_anchor_filter_enabled: bool = False
     anchor_text_ref_label_filter_enabled: bool = False
     rg_structural_anchor_filter_enabled: bool = False
@@ -127,9 +132,14 @@ class SemanticDev40Tuning:
     rg_vdep_model: str = "gemini:gemini-3-flash-preview"
     rg_leakage_correction_enabled: bool = False
     rg_leaky_label_hard_reject_enabled: bool = False
+    rg_scrub_color_anchor_phrases_enabled: bool = False
     rg_candidate_oversample_boost: float = 0.0
     rg_per_image_hard_cap: int = 1
+    tp_per_image_hard_cap: int = 1  # -1 = unlimited; 0 = eliminate all TEXT_PROPERTY; 1 = at most 1 per image (default)
     property_candidate_selection_bonus: float = 0.0
+    direct_read_selection_bonus: float = 0.25
+    dr_generic_anchor_penalty: float = 0.0
+    dr_same_anchor_repeat_penalty: float = 0.0
     anchor_label_groundback_enabled: bool = False
     anchor_label_groundback_iou_threshold: float = 0.35
     qwen_open_tag_prompt_mode: str = "basic"
@@ -199,6 +209,14 @@ def load_semantic_dev40_tuning() -> SemanticDev40Tuning:
         property_specific_threshold=_env_int("SGOCR_PROPERTY_SPECIFIC_THRESHOLD", 4),
         anchor_property_specific_threshold=_env_int("SGOCR_ANCHOR_PROPERTY_SPECIFIC_THRESHOLD", 3),
         max_negative_yesno_per_image=_env_int("SGOCR_MAX_NEGATIVE_YESNO_PER_IMAGE", 1),
+        max_yesno_per_image=_env_int("SGOCR_MAX_YESNO_PER_IMAGE", -1),
+        tp_visual_only_enabled=_env_int("SGOCR_TP_VISUAL_ONLY_ENABLED", 0) != 0,
+        tp_visual_avoid_text_reference_with_specific_location_enabled=(
+            _env_int("SGOCR_TP_VISUAL_AVOID_TEXT_REFERENCE_WITH_SPECIFIC_LOCATION_ENABLED", 0) != 0
+        ),
+        tp_visual_high_prior_answer_filter_enabled=(
+            _env_int("SGOCR_TP_VISUAL_HIGH_PRIOR_ANSWER_FILTER_ENABLED", 0) != 0
+        ),
         anchor_type_soft_cap_count=_env_int("SGOCR_ANCHOR_TYPE_SOFT_CAP_COUNT", 2),
         anchor_type_soft_cap_penalty=_env_float("SGOCR_ANCHOR_TYPE_SOFT_CAP_PENALTY", 0.15),
         reverse_ground_directional_local_bias=_env_float("SGOCR_REVERSE_GROUND_DIRECTIONAL_LOCAL_BIAS", 0.20),
@@ -243,6 +261,7 @@ def load_semantic_dev40_tuning() -> SemanticDev40Tuning:
         qwen_anti_ocr_prompt_enabled=_env_int("SGOCR_QWEN_ANTI_OCR_PROMPT_ENABLED", 0) != 0,
         qwen_no_text_ref_prompt_enabled=_env_int("SGOCR_QWEN_NO_TEXT_REF_PROMPT_ENABLED", 0) != 0,
         qwen_ita15_prompt_enabled=_env_int("SGOCR_QWEN_ITA15_PROMPT_ENABLED", 0) != 0,
+        qwen_dam01_prompt_enabled=_env_int("SGOCR_QWEN_DAM01_PROMPT_ENABLED", 0) != 0,
         qwen_degenerate_anchor_filter_enabled=_env_int("SGOCR_QWEN_DEGENERATE_ANCHOR_FILTER_ENABLED", 0) != 0,
         anchor_text_ref_label_filter_enabled=_env_int("SGOCR_ANCHOR_TEXT_REF_LABEL_FILTER_ENABLED", 0) != 0,
         rg_structural_anchor_filter_enabled=_env_int("SGOCR_RG_STRUCTURAL_ANCHOR_FILTER_ENABLED", 0) != 0,
@@ -255,9 +274,14 @@ def load_semantic_dev40_tuning() -> SemanticDev40Tuning:
         rg_vdep_model=_env_str("SGOCR_RG_VDEP_MODEL", "gemini:gemini-3-flash-preview"),
         rg_leakage_correction_enabled=_env_int("SGOCR_RG_LEAKAGE_CORRECTION_ENABLED", 0) != 0,
         rg_leaky_label_hard_reject_enabled=_env_int("SGOCR_RG_LEAKY_LABEL_HARD_REJECT_ENABLED", 0) != 0,
+        rg_scrub_color_anchor_phrases_enabled=_env_int("SGOCR_RG_SCRUB_COLOR_ANCHOR_PHRASES_ENABLED", 0) != 0,
         rg_candidate_oversample_boost=_env_float("SGOCR_RG_CANDIDATE_OVERSAMPLE_BOOST", 0.0),
         rg_per_image_hard_cap=_env_int("SGOCR_RG_PER_IMAGE_HARD_CAP", 1),
+        tp_per_image_hard_cap=_env_int("SGOCR_TP_PER_IMAGE_HARD_CAP", 1),
         property_candidate_selection_bonus=_env_float("SGOCR_PROPERTY_CANDIDATE_SELECTION_BONUS", 0.0),
+        direct_read_selection_bonus=_env_float("SGOCR_DIRECT_READ_SELECTION_BONUS", 0.25),
+        dr_generic_anchor_penalty=_env_float("SGOCR_DR_GENERIC_ANCHOR_PENALTY", 0.0),
+        dr_same_anchor_repeat_penalty=_env_float("SGOCR_DR_SAME_ANCHOR_REPEAT_PENALTY", 0.0),
         anchor_label_groundback_enabled=_env_int("SGOCR_ANCHOR_LABEL_GROUNDBACK_ENABLED", 0) != 0,
         anchor_label_groundback_iou_threshold=_env_float("SGOCR_ANCHOR_LABEL_GROUNDBACK_IOU_THRESHOLD", 0.35),
         qwen_open_tag_prompt_mode=_env_str("SGOCR_QWEN_OPEN_TAG_PROMPT_MODE", "basic"),
@@ -393,10 +417,20 @@ def load_semantic_dev40_tuning() -> SemanticDev40Tuning:
         raise ValueError("SGOCR_SAM3_TARGET_AREA_START must be > 0")
     if tuning.max_negative_yesno_per_image < 0:
         raise ValueError("SGOCR_MAX_NEGATIVE_YESNO_PER_IMAGE must be >= 0")
+    if tuning.max_yesno_per_image < -1:
+        raise ValueError("SGOCR_MAX_YESNO_PER_IMAGE must be >= -1 (-1 = unlimited)")
+    if tuning.tp_per_image_hard_cap < 0:
+        raise ValueError("SGOCR_TP_PER_IMAGE_HARD_CAP must be >= 0 (0 = eliminate TEXT_PROPERTY)")
     if tuning.anchor_type_soft_cap_count < 0:
         raise ValueError("SGOCR_ANCHOR_TYPE_SOFT_CAP_COUNT must be >= 0")
     if tuning.anchor_type_soft_cap_penalty < 0.0:
         raise ValueError("SGOCR_ANCHOR_TYPE_SOFT_CAP_PENALTY must be >= 0")
+    if tuning.direct_read_selection_bonus < 0.0:
+        raise ValueError("SGOCR_DIRECT_READ_SELECTION_BONUS must be >= 0")
+    if tuning.dr_generic_anchor_penalty < 0.0:
+        raise ValueError("SGOCR_DR_GENERIC_ANCHOR_PENALTY must be >= 0")
+    if tuning.dr_same_anchor_repeat_penalty < 0.0:
+        raise ValueError("SGOCR_DR_SAME_ANCHOR_REPEAT_PENALTY must be >= 0")
     if tuning.generic_anchor_retry_penalty < 0.0:
         raise ValueError("SGOCR_GENERIC_ANCHOR_RETRY_PENALTY must be >= 0")
     if not 0.0 < tuning.qwen_anchor_gpu_memory_utilization < 1.0:

@@ -433,22 +433,29 @@ def _call_openai_text_only_eval(model: str, row: dict[str, Any], *, timeout_s: i
     Mirrors _call_openai_responses but omits the image from the input content. Used to
     check whether an RG question can be answered from text alone, identifying text-leaky rows.
     """
-    # reasoning models (codex, o-series) accept the `reasoning` param; non-reasoning models don't.
-    _is_reasoning_model = any(tok in model for tok in ("codex", "o1", "o3", "o4", "-o-"))
+    prompt = (
+        _benchmark_prompt(row)
+        + "\n"
+        + "This is a text-only probe. There is intentionally no image.\n"
+        + "Give your best guess from the question text alone.\n"
+        + "Do not leave the answer blank.\n"
+        + "Do not say you need the image or that no image was provided.\n"
+        + "Return only the shortest plausible answer."
+    )
     body: dict[str, Any] = {
         "model": model,
         "input": [
             {
                 "role": "user",
                 "content": [
-                    {"type": "input_text", "text": _benchmark_prompt(row)},
+                    {"type": "input_text", "text": prompt},
                 ],
             }
         ],
-        "max_output_tokens": 32,
+        "reasoning": {"effort": "none"},
+        "text": {"verbosity": "low"},
+        "max_output_tokens": 64,
     }
-    if _is_reasoning_model:
-        body["reasoning"] = {"effort": "low"}
     resp = requests.post(
         "https://api.openai.com/v1/responses",
         headers={

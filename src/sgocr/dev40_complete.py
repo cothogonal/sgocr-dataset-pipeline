@@ -487,13 +487,39 @@ def grounding_context_from_tuple(tuple_row: dict[str, Any]) -> dict[str, Any]:
 
 
 def candidate_anchor_label(candidate: dict[str, Any]) -> str:
-    return str(candidate.get("query_anchor_label") or candidate["tuple"]["anchor_label"])
+    label = str(candidate.get("query_anchor_label") or candidate["tuple"]["anchor_label"])
+    tuning = load_semantic_dev40_tuning()
+    if (
+        str(candidate.get("question_type") or "").upper() == "REVERSE_GROUND"
+        and tuning.rg_scrub_color_anchor_phrases_enabled
+    ):
+        return _strip_simple_color_tokens_from_phrase(label)
+    return label
 
 
 def candidate_anchor_phrases(candidate: dict[str, Any]) -> list[str]:
-    if candidate.get("query_anchor_synonyms"):
-        return list(candidate["query_anchor_synonyms"])
-    return list(candidate["tuple"].get("anchor_synonyms") or [candidate["tuple"]["anchor_label"]])
+    phrases = (
+        list(candidate["query_anchor_synonyms"])
+        if candidate.get("query_anchor_synonyms")
+        else list(candidate["tuple"].get("anchor_synonyms") or [candidate["tuple"]["anchor_label"]])
+    )
+    tuning = load_semantic_dev40_tuning()
+    if (
+        str(candidate.get("question_type") or "").upper() == "REVERSE_GROUND"
+        and tuning.rg_scrub_color_anchor_phrases_enabled
+    ):
+        cleaned: list[str] = []
+        seen: set[str] = set()
+        for phrase in phrases:
+            text = _strip_simple_color_tokens_from_phrase(str(phrase))
+            norm = normalize_answer(text)
+            if not norm or norm in seen:
+                continue
+            seen.add(norm)
+            cleaned.append(text)
+        if cleaned:
+            return cleaned
+    return phrases
 
 
 def candidate_anchor_box(candidate: dict[str, Any]) -> list[float] | None:
@@ -580,6 +606,11 @@ def candidate_specific_location_synonyms(candidate: dict[str, Any]) -> list[str]
 def candidate_anchor_color(candidate: dict[str, Any]) -> str:
     tuning = load_semantic_dev40_tuning()
     if not tuning.anchor_reference_color_enabled:
+        return ""
+    if (
+        str(candidate.get("question_type") or "").upper() == "REVERSE_GROUND"
+        and tuning.rg_scrub_color_anchor_phrases_enabled
+    ):
         return ""
     explicit = str(candidate.get("query_anchor_color") or candidate["tuple"].get("anchor_color") or "").strip()
     if explicit:
@@ -827,6 +858,42 @@ _SIMPLE_COLORS = frozenset({
     "red", "blue", "green", "brown", "white", "black", "gray", "grey",
     "yellow", "orange", "purple", "pink", "silver", "gold",
 })
+
+_GENERIC_DIRECT_READ_ANCHOR_TOKENS: frozenset[str] = frozenset({
+    "area", "axis", "badge", "bar", "board", "button", "cell", "chart",
+    "display", "label", "legend", "panel", "plot", "region", "screen",
+    "sign", "surface", "table", "wall",
+})
+
+_GENERIC_TEXT_PROPERTY_ANCHOR_TOKENS: frozenset[str] = frozenset({
+    "area", "axis", "background", "button", "cell", "chart", "label",
+    "legend", "panel", "plot", "region", "surface", "table",
+})
+
+_HIGH_PRIOR_TEXT_PROPERTY_ANSWERS: dict[str, frozenset[str]] = {
+    "text_color": frozenset({"white", "black", "gray", "grey", "blue"}),
+    "text_curvature": frozenset({"straight"}),
+}
+
+
+def _strip_simple_color_tokens_from_phrase(text: str) -> str:
+    raw = str(text or "").strip()
+    if not raw:
+        return ""
+    kept = [part for part in raw.split() if normalize_answer(part) not in _SIMPLE_COLORS]
+    cleaned = " ".join(kept).strip()
+    cleaned = re.sub(r"\bwith\s+(?=$)", "", cleaned, flags=re.IGNORECASE).strip()
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" ,")
+    return cleaned or raw
+
+
+def _anchor_label_has_generic_tokens(anchor_label: str, tokens: frozenset[str]) -> bool:
+    label_tokens = set(normalize_answer(anchor_label).split())
+    return bool(label_tokens & tokens)
+
+
+def _is_high_prior_text_property_answer(answer: str, property_type: str) -> bool:
+    return normalize_answer(answer) in _HIGH_PRIOR_TEXT_PROPERTY_ANSWERS.get(str(property_type or ""), frozenset())
 
 # Shape tokens that, when present in an anchor_label, make anchor_shape ANCHOR_PROPERTY
 # questions circular (the answer is derivable from the label itself).
@@ -1403,6 +1470,16 @@ def select_candidates(candidates: list[dict[str, Any]], *, target_count: int) ->
             c for c in candidates
             if _anchor_centroid_offset(c["tuple"]) >= tuning.spatial_min_centroid_offset
         ]
+    if tuning.rg_per_image_hard_cap == 0:
+        candidates = [c for c in candidates if c["question_type"] != "REVERSE_GROUND"]
+    if tuning.tp_per_image_hard_cap == 0:
+        candidates = [c for c in candidates if c["question_type"] != "TEXT_PROPERTY"]
+    elif tuning.tp_visual_only_enabled:
+        candidates = [
+            c for c in candidates
+            if c["question_type"] != "TEXT_PROPERTY"
+            or str(c.get("text_property_type") or "") in TEXT_PROPERTY_VISUAL_TYPES
+        ]
     if len(candidates) <= target_count:
         return sorted(candidates, key=lambda item: (-float(item["quality"]), item["candidate_id"]))
 
@@ -1421,7 +1498,14 @@ def select_candidates(candidates: list[dict[str, Any]], *, target_count: int) ->
             score += 1.7 if text_key not in used_text_nodes else 0.0
             score += 1.1 if used_qtypes[candidate["question_type"]] == 0 else 0.0
             if candidate["question_type"] == "DIRECT_READ":
-                score += 0.25
+                score += float(tuning.direct_read_selection_bonus)
+                if tuning.dr_generic_anchor_penalty > 0.0 and _anchor_label_has_generic_tokens(
+                    anchor_label_norm,
+                    _GENERIC_DIRECT_READ_ANCHOR_TOKENS,
+                ):
+                    score -= float(tuning.dr_generic_anchor_penalty)
+                if tuning.dr_same_anchor_repeat_penalty > 0.0 and anchor_label_norm:
+                    score -= float(tuning.dr_same_anchor_repeat_penalty) * float(used_anchor_labels[anchor_label_norm])
             if tuning.per_image_anchor_diversity_bonus > 0.0 and anchor_label_norm and used_anchor_labels[anchor_label_norm] == 0:
                 score += tuning.per_image_anchor_diversity_bonus
             if candidate["question_type"] == "YES_NO" and candidate.get("yesno_polarity") == "negative":
@@ -1480,9 +1564,10 @@ def enforce_type_constraints(selected: list[dict[str, Any]], candidates: list[di
                 selected.remove(min(removable, key=lambda candidate: float(candidate["quality"])))
         selected.append(pick)
 
-    rg_cap = max(1, int(tuning.rg_per_image_hard_cap))
+    rg_cap = max(0, int(tuning.rg_per_image_hard_cap))
+    tp_cap = max(0, int(tuning.tp_per_image_hard_cap))
     for limited_type in ("REVERSE_GROUND", "TEXT_PROPERTY", "ANCHOR_PROPERTY"):
-        cap = rg_cap if limited_type == "REVERSE_GROUND" else 1
+        cap = rg_cap if limited_type == "REVERSE_GROUND" else (tp_cap if limited_type == "TEXT_PROPERTY" else 1)
         while sum(1 for item in selected if item["question_type"] == limited_type) > cap:
             items = [item for item in selected if item["question_type"] == limited_type]
             selected.remove(min(items, key=lambda item: float(item["quality"])))
@@ -1490,6 +1575,11 @@ def enforce_type_constraints(selected: list[dict[str, Any]], candidates: list[di
     while sum(1 for item in selected if item["question_type"] == "YES_NO" and item.get("yesno_polarity") == "negative") > tuning.max_negative_yesno_per_image:
         items = [item for item in selected if item["question_type"] == "YES_NO" and item.get("yesno_polarity") == "negative"]
         selected.remove(min(items, key=lambda item: float(item["quality"])))
+
+    if tuning.max_yesno_per_image >= 0:
+        while sum(1 for item in selected if item["question_type"] == "YES_NO") > tuning.max_yesno_per_image:
+            items = [item for item in selected if item["question_type"] == "YES_NO"]
+            selected.remove(min(items, key=lambda item: float(item["quality"])))
 
     while len(selected) > target:
         selected.remove(min(selected, key=lambda item: float(item["quality"])))
@@ -2482,17 +2572,37 @@ def build_batched_prompt(selected_candidates: list[dict[str, Any]]) -> str:
                         lines.append(f'Use only the provided allowed anchor/location phrases plus simple connectors, for example "{candidate_anchor_label(candidate)} at the {preferred_location_phrase}" or "the {preferred_location_phrase} on the {candidate_anchor_label(candidate)}".')
         elif qtype == "TEXT_PROPERTY":
             prop = candidate["text_property_type"]
+            use_text_reference = not (
+                prop in {"text_color", "text_orientation", "text_curvature"}
+                and tuning.tp_visual_avoid_text_reference_with_specific_location_enabled
+                and candidate.get("query_location_required")
+            )
             if prop in {"word_count", "first_word", "last_word"}:
                 lines.append(f"Write 1 question about the text property `{prop}` for this text at this location.")
                 lines.append(f'The answer must be exactly "{candidate["expected_answer"]}".')
             elif prop == "text_color":
-                lines.append(f'Write 1 question about the visible color of the text that says "{candidate.get("query_text_reference") or tuple_row["answer"]}" at this location.')
+                if use_text_reference:
+                    lines.append(
+                        f'Write 1 question about the visible color of the text that says "{candidate.get("query_text_reference") or tuple_row["answer"]}" at this location.'
+                    )
+                else:
+                    lines.append("Write 1 question about the visible color of the target text at this location.")
                 lines.append('The answer must be a short color phrase of 1 to 3 words, such as "white" or "bright red".')
             elif prop == "text_orientation":
-                lines.append(f'Write 1 question about the visible orientation of the text that says "{candidate.get("query_text_reference") or tuple_row["answer"]}" at this location.')
+                if use_text_reference:
+                    lines.append(
+                        f'Write 1 question about the visible orientation of the text that says "{candidate.get("query_text_reference") or tuple_row["answer"]}" at this location.'
+                    )
+                else:
+                    lines.append("Write 1 question about the visible orientation of the target text at this location.")
                 lines.append("The answer must be a short orientation phrase of 1 to 3 words, such as horizontal, vertical, or diagonal.")
             elif prop == "text_curvature":
-                lines.append(f'Write 1 question about whether the text that says "{candidate.get("query_text_reference") or tuple_row["answer"]}" looks straight, curved, or arched.')
+                if use_text_reference:
+                    lines.append(
+                        f'Write 1 question about whether the text that says "{candidate.get("query_text_reference") or tuple_row["answer"]}" looks straight, curved, or arched.'
+                    )
+                else:
+                    lines.append("Write 1 question about whether the target text looks straight, curved, or arched.")
                 lines.append("The answer must be a short shape phrase of 1 to 3 words.")
             if candidate.get("query_location_required"):
                 lines.append(f'Because nearby text boxes share this region, mention the preferred specific location phrase "{preferred_location_phrase}" so the property question targets the correct text.')
@@ -3000,6 +3110,14 @@ def validate_candidate_output(candidate: dict[str, Any], item: dict[str, Any] | 
             failure_reason = "text_property_specific_location_missing"
         elif location_required and not location_match_ok:
             failure_reason = "text_property_location_missing"
+        elif (
+            tuning.tp_visual_high_prior_answer_filter_enabled
+            and property_type in {"text_color", "text_curvature"}
+            and _is_high_prior_text_property_answer(answer, property_type)
+            and _anchor_label_has_generic_tokens(candidate_anchor_label(candidate), _GENERIC_TEXT_PROPERTY_ANCHOR_TOKENS)
+        ):
+            mechanical_ok = False
+            failure_reason = "text_property_prior_leaky"
         elif explicit_specific_required and not specific_location_ok:
             mechanical_ok = False
             failure_reason = "text_property_specific_location_missing"

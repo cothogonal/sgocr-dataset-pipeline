@@ -16,14 +16,20 @@ from sgocr.semantic_dev40_tuning import load_semantic_dev40_tuning
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _candidate(question_type: str, quality: float = 1.0, candidate_id: str = "c1") -> dict:
+def _candidate(
+    question_type: str,
+    quality: float = 1.0,
+    candidate_id: str = "c1",
+    *,
+    anchor_label: str = "test_label",
+) -> dict:
     return {
         "candidate_id": candidate_id,
         "question_type": question_type,
         "quality": quality,
         "tuple": {
             "text_node_ids": [candidate_id],
-            "anchor_label": "test_label",
+            "anchor_label": anchor_label,
             "image_id": "img-1",
         },
     }
@@ -140,6 +146,30 @@ class TestPropertyCandidateSelectionBonus(unittest.TestCase):
             result = _run_select([rg, tp], target=1)
         # RG quality=5.0 >> TP quality=1.0+2.0=3.0; RG wins
         self.assertEqual(result[0]["question_type"], "REVERSE_GROUND")
+
+
+class TestDirectReadSelectionPenalties(unittest.TestCase):
+    def test_lowered_direct_read_bonus_allows_tp_to_win(self):
+        dr = _candidate("DIRECT_READ", quality=1.0, candidate_id="dr-1")
+        tp = _candidate("TEXT_PROPERTY", quality=1.05, candidate_id="tp-1")
+        with unittest.mock.patch.dict(os.environ, {"SGOCR_DIRECT_READ_SELECTION_BONUS": "0.0"}):
+            result = _run_select([dr, tp], target=1)
+        self.assertEqual(result[0]["question_type"], "TEXT_PROPERTY")
+
+    def test_generic_direct_read_penalty_demotes_low_information_anchor(self):
+        generic_dr = _candidate("DIRECT_READ", quality=1.0, candidate_id="dr-1", anchor_label="panel")
+        specific_dr = _candidate("DIRECT_READ", quality=0.95, candidate_id="dr-2", anchor_label="metal canister")
+        with unittest.mock.patch.dict(os.environ, {"SGOCR_DR_GENERIC_ANCHOR_PENALTY": "0.2"}):
+            result = _run_select([generic_dr, specific_dr], target=1)
+        self.assertEqual(result[0]["candidate_id"], "dr-2")
+
+    def test_same_anchor_repeat_penalty_prefers_new_anchor_label(self):
+        first = _candidate("DIRECT_READ", quality=1.2, candidate_id="dr-first", anchor_label="sign")
+        repeated = _candidate("DIRECT_READ", quality=1.0, candidate_id="dr-repeat", anchor_label="sign")
+        novel = _candidate("DIRECT_READ", quality=0.97, candidate_id="dr-novel", anchor_label="receipt")
+        with unittest.mock.patch.dict(os.environ, {"SGOCR_DR_SAME_ANCHOR_REPEAT_PENALTY": "0.2"}):
+            result = _run_select([first, repeated, novel], target=2)
+        self.assertEqual([row["candidate_id"] for row in result], ["dr-first", "dr-novel"])
 
 
 # ---------------------------------------------------------------------------

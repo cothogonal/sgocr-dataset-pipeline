@@ -73,21 +73,22 @@ def _nemotron_src_root() -> Path:
 
 def _ensure_nemotron_src_on_path() -> Path:
     src_root = _nemotron_src_root().resolve()
-    if str(src_root) not in sys.path:
+    if src_root.exists() and str(src_root) not in sys.path:
         sys.path.insert(0, str(src_root))
     return src_root
 
 
 def _load_nemotron_pipeline() -> Any:
     src_root = _ensure_nemotron_src_on_path()
-    if not src_root.exists():
-        raise RuntimeError(
-            f"Nemotron OCR source tree is missing at {src_root}. "
-            "Set SGOCR_NEMOTRON_SRC to a valid checkout of nvidia/nemotron-ocr-v2."
-        )
     try:
         from nemotron_ocr.inference.pipeline_v2 import NemotronOCRV2
     except Exception as exc:  # pragma: no cover - host/toolchain dependent
+        if not src_root.exists():
+            raise RuntimeError(
+                f"Nemotron OCR source tree is missing at {src_root}, and the installed package import also failed. "
+                "Set SGOCR_NEMOTRON_SRC to a valid checkout of nvidia/nemotron-ocr-v2 or install a working "
+                f"`nemotron_ocr` package. Import failure: {exc}"
+            ) from exc
         raise RuntimeError(
             "Nemotron OCR v2 is unavailable on this host. "
             "The NVIDIA package depends on compiled CUDA/C++ ops (nemotron_ocr_cpp), "

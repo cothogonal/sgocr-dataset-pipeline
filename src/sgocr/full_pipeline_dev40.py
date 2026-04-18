@@ -38,6 +38,7 @@ from .ollama_anchor import (
 from .qwen_anchor_vllm import (
     INDEPENDENT_QWEN_INVENTORY_PROMPT,
     INDEPENDENT_QWEN_INVENTORY_PROMPT_ANTI_OCR,
+    INDEPENDENT_QWEN_INVENTORY_PROMPT_DAM01,
     INDEPENDENT_QWEN_INVENTORY_PROMPT_NO_TEXT_REF,
     INDEPENDENT_QWEN_INVENTORY_PROMPT_ITA15,
     OPEN_QWEN_LOCAL_DISCOVERY_PROMPT,
@@ -1130,6 +1131,19 @@ def build_dev40_semantic_dataset(
         else:
             failure_counts[row.get("failure_reason") or "validation_failed"] += 1
 
+    rejected_by_stage: dict[str, str] = {
+        str(row.get("sample_id") or ""): str(row.get("failure_reason") or "validation_failed")
+        for row in raw_results
+        if not (row.get("ok") and (row.get("summary") or {}).get("accepted_count") == 1)
+    }
+
+    def _mark_stage_rejections(before_rows: list[dict], after_rows: list[dict], stage: str) -> None:
+        after_ids = {str(row.get("sample_id") or "") for row in after_rows}
+        for row in before_rows:
+            sample_id = str(row.get("sample_id") or "")
+            if sample_id and sample_id not in after_ids:
+                rejected_by_stage[sample_id] = stage
+
     inline_frontier_summary = annotate_inline_frontier(
         final_rows,
         model=str(load_semantic_dev40_tuning().inline_frontier_model),
@@ -1166,6 +1180,7 @@ def build_dev40_semantic_dataset(
                 return True
             return str(row.get("question_type") or "").upper() in _gate_question_types
 
+        before_frontier_gate = list(final_rows)
         if wf1_floor < 0.0:
             # Standard binary gate: keep rows the frontier model answered correctly, or where eval
             # errored, or where the question type is excluded from the gate.
@@ -1187,6 +1202,7 @@ def build_dev40_semantic_dataset(
                 return word_f1 >= wf1_floor
 
             final_rows = [row for row in final_rows if _passes_lenient_gate(row)]
+        _mark_stage_rejections(before_frontier_gate, final_rows, "inline_frontier_gate")
 
         frontier_gate_errored = sum(1 for row in final_rows if _gated(row) and _frontier_eval_errored(row))
         frontier_gate_rejected = pre_gate - len(final_rows)
@@ -1205,11 +1221,13 @@ def build_dev40_semantic_dataset(
     if tuning.vision_dependence_gate_enabled and final_rows:
         from .dev200_eval import apply_vision_dependence_gate
         pre_gate = len(final_rows)
+        before_vdep_gate = list(final_rows)
         final_rows, vdep_stats = apply_vision_dependence_gate(
             final_rows,
             model=str(tuning.inline_frontier_model),
             workers=workers,
         )
+        _mark_stage_rejections(before_vdep_gate, final_rows, "vision_dependence_gate")
         failure_counts["vision_dependence_gate_rejected"] = vdep_stats["rejected"]
         print(f"[vision_dependence_gate] {vdep_stats}", flush=True)
 
@@ -1221,12 +1239,14 @@ def build_dev40_semantic_dataset(
     # token in the question are corrected (token stripped) and re-checked before final discard.
     if tuning.rg_vdep_check_enabled and final_rows:
         from .dev200_eval import apply_rg_vdep_check
+        before_rg_vdep = list(final_rows)
         final_rows, rg_vdep_stats = apply_rg_vdep_check(
             final_rows,
             model=str(tuning.rg_vdep_model),
             workers=workers,
             correction_enabled=tuning.rg_leakage_correction_enabled,
         )
+        _mark_stage_rejections(before_rg_vdep, final_rows, "rg_vdep_check")
         failure_counts["rg_vdep_rejected"] = rg_vdep_stats["rejected_rg"]
         print(f"[rg_vdep_check] {rg_vdep_stats}", flush=True)
 
@@ -1254,7 +1274,9 @@ def build_dev40_semantic_dataset(
             label_words = str(row.get("anchor_label") or "").lower().split()
             return any(w in _rg_color_tokens or w in _rg_shape_tokens for w in label_words)
 
+        before_rg_leaky_reject = list(final_rows)
         final_rows = [row for row in final_rows if not _has_leaky_label(row)]
+        _mark_stage_rejections(before_rg_leaky_reject, final_rows, "rg_leaky_label_hard_reject")
         rg_leaky_rejected = pre_rg_reject - len(final_rows)
         failure_counts["rg_leaky_label_rejected"] = rg_leaky_rejected
         print(
@@ -1268,9 +1290,21 @@ def build_dev40_semantic_dataset(
         flush=True,
     )
 
+    accepted_sample_ids = {str(row.get("sample_id") or "") for row in final_rows}
+    rejected_rows = []
+    for row in raw_results:
+        sample_id = str(row.get("sample_id") or "")
+        if sample_id in accepted_sample_ids:
+            continue
+        annotated_row = dict(row)
+        annotated_row["rejection_stage"] = rejected_by_stage.get(sample_id, "post_teacher_filter")
+        annotated_row["rejection_reason_final"] = rejected_by_stage.get(sample_id, "post_teacher_filter")
+        rejected_rows.append(annotated_row)
+
     write_jsonl(out_dir / "raw_results.jsonl", raw_results)
     write_jsonl(out_dir / "ocr_qa_dataset.jsonl", final_rows)
     write_jsonl(out_dir / "accepted_dataset.jsonl", final_rows)
+    write_jsonl(out_dir / "rejected_dataset.jsonl", rejected_rows)
 
     stage_counts = {
         "images": len(image_specs),
@@ -1285,6 +1319,7 @@ def build_dev40_semantic_dataset(
         "selected_tuples": len(selected_rows),
         "raw_qa_rows": len(raw_results),
         "final_qa_rows": len(final_rows),
+        "rejected_qa_rows": len(rejected_rows),
     }
     summary = {
         "experiment": {
@@ -1637,7 +1672,8 @@ def run_anchor_stage(
         if use_gemma_anchor_backend
         else None
     )
-    sam3_refiner = Sam3Refiner(device=device, confidence_threshold=tuning.sam3_confidence_threshold) if _sam3_prompt_limit() > 0 else None
+    sam3_refiner: Sam3Refiner | None = None
+    sam3_refiner_enabled = _sam3_prompt_limit() > 0
     nodes_by_image: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for node in resolvable_nodes:
         nodes_by_image[str(node["image_id"])].append(node)
@@ -1691,6 +1727,8 @@ def run_anchor_stage(
                         if use_gemma_anchor_backend and os.environ.get("SGOCR_GEMMA_ITA16_PROMPT_VARIANT", "")
                         else GEMMA_INDEPENDENT_INVENTORY_PROMPT_ITA15
                         if use_gemma_anchor_backend and tuning.qwen_ita15_prompt_enabled
+                        else INDEPENDENT_QWEN_INVENTORY_PROMPT_DAM01
+                        if tuning.qwen_dam01_prompt_enabled
                         else INDEPENDENT_QWEN_INVENTORY_PROMPT_ITA15
                         if tuning.qwen_ita15_prompt_enabled
                         else INDEPENDENT_QWEN_INVENTORY_PROMPT_NO_TEXT_REF
@@ -1861,10 +1899,19 @@ def run_anchor_stage(
 
             # --- Structural fallback for degenerate inventory results ---
             if tuning.qwen_structural_fallback_enabled:
-                from .qwen_anchor_vllm import STRUCTURAL_FALLBACK_QWEN_PROMPT, STRUCTURAL_FALLBACK_QWEN_PROMPT_ANTI_OCR, STRUCTURAL_FALLBACK_QWEN_PROMPT_NO_TEXT_REF, STRUCTURAL_FALLBACK_QWEN_PROMPT_ITA15, is_degenerate_inventory
+                from .qwen_anchor_vllm import (
+                    STRUCTURAL_FALLBACK_QWEN_PROMPT,
+                    STRUCTURAL_FALLBACK_QWEN_PROMPT_ANTI_OCR,
+                    STRUCTURAL_FALLBACK_QWEN_PROMPT_DAM01,
+                    STRUCTURAL_FALLBACK_QWEN_PROMPT_NO_TEXT_REF,
+                    STRUCTURAL_FALLBACK_QWEN_PROMPT_ITA15,
+                    is_degenerate_inventory,
+                )
                 _structural_fallback_prompt = (
                     GEMMA_STRUCTURAL_FALLBACK_PROMPT_ITA15
                     if use_gemma_anchor_backend and tuning.qwen_ita15_prompt_enabled
+                    else STRUCTURAL_FALLBACK_QWEN_PROMPT_DAM01
+                    if tuning.qwen_dam01_prompt_enabled
                     else STRUCTURAL_FALLBACK_QWEN_PROMPT_ITA15
                     if tuning.qwen_ita15_prompt_enabled
                     else STRUCTURAL_FALLBACK_QWEN_PROMPT_NO_TEXT_REF
@@ -2067,6 +2114,9 @@ def run_anchor_stage(
                 row["raw_labels"] = list(inventory_tags)
                 row["discovered_tags"] = list(inventory_tags)
                 row["final_prompt_tags"] = list(inventory_tags)
+
+    if sam3_refiner_enabled:
+        sam3_refiner = Sam3Refiner(device=device, confidence_threshold=tuning.sam3_confidence_threshold)
 
     select_progress = _make_stage_progress_logger("anchor_candidate_selection", len(resolvable_nodes))
     selected_count = 0
