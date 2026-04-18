@@ -262,7 +262,7 @@ class TestFullPipelineDev40(unittest.TestCase):
                 },
                 clear=True,
             ):
-                with patch("sgocr.full_pipeline_dev40.QwenAnchorGrounderVLLM", FakeQwenGrounder):
+                with patch("sgocr.pipeline_stages.QwenAnchorGrounderVLLM", FakeQwenGrounder):
                     anchor_tag_rows, grounded_anchor_rows, best_anchor_by_node = run_anchor_stage(
                         image_specs=[{"image_id": "img-qwen", "image_path": image_path}],
                         resolvable_nodes=nodes,
@@ -332,7 +332,7 @@ class TestFullPipelineDev40(unittest.TestCase):
                 },
                 clear=True,
             ):
-                with patch("sgocr.full_pipeline_dev40.QwenAnchorGrounderVLLM", FakeQwenGrounder):
+                with patch("sgocr.pipeline_stages.QwenAnchorGrounderVLLM", FakeQwenGrounder):
                     _, grounded_anchor_rows, best_anchor_by_node = run_anchor_stage(
                         image_specs=[{"image_id": "img-qwen-global", "image_path": image_path}],
                         resolvable_nodes=nodes,
@@ -397,7 +397,7 @@ class TestFullPipelineDev40(unittest.TestCase):
                 },
                 clear=True,
             ):
-                with patch("sgocr.full_pipeline_dev40.QwenAnchorGrounderVLLM", FakeQwenGrounder):
+                with patch("sgocr.pipeline_stages.QwenAnchorGrounderVLLM", FakeQwenGrounder):
                     run_anchor_stage(
                         image_specs=[{"image_id": "img-qwen-open", "image_path": image_path}],
                         resolvable_nodes=nodes,
@@ -466,7 +466,7 @@ class TestFullPipelineDev40(unittest.TestCase):
                 },
                 clear=True,
             ):
-                with patch("sgocr.full_pipeline_dev40.QwenAnchorGrounderVLLM", FakeQwenGrounder):
+                with patch("sgocr.pipeline_stages.QwenAnchorGrounderVLLM", FakeQwenGrounder):
                     anchor_tag_rows, grounded_anchor_rows, best_anchor_by_node = run_anchor_stage(
                         image_specs=[{"image_id": "img-qwen-independent", "image_path": image_path}],
                         resolvable_nodes=nodes,

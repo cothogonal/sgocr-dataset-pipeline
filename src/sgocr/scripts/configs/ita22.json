@@ -1,0 +1,90 @@
+{
+  "name": "ita22",
+  "description": "Precision-first target-6 primary pass + dual-anchor rescue for mixed_dev150",
+  "source_name": "chartqa50_textocr50_cocotext50_source_20260410_110952",
+  "reference_report_json": "sgocr_mixed_ita21_20260417_060334_report.json",
+  "model": "gemini-2.5-flash",
+  "workers": 6,
+  "max_side": 768,
+  "device": "auto",
+  "max_tags_per_image": 14,
+  "grounding_threshold": 0.28,
+  "primary_target_per_image": 6,
+  "direct_read_selection_bonus": 0.05,
+  "dr_generic_anchor_penalty": 0.18,
+  "dr_same_anchor_repeat_penalty": 0.10,
+  "property_candidate_selection_bonus": 0.30,
+  "per_image_anchor_diversity_bonus": 0.15,
+  "image_dependence_model": "gemini-3-flash-preview",
+  "image_dependence_workers": 4,
+  "qwen_model": "Qwen/Qwen3-VL-8B-Instruct-FP8",
+  "qwen_gpu_memory_utilization": 0.85,
+  "qwen_batch_size": 3,
+  "rg_vdep_model": "gemini:gemini-3-pro-preview",
+  "primary_ocr_cache_dir": "mixed_dev150/sgocr_mixed_ita15_20260415_204008_ita15_t8",
+  "variants": {
+    "precision_r48_t6": {
+      "description": "Primary target=6 precision pass, then DAM01 Qwen rescue on the top 48 low-diversity images",
+      "env_overrides": {
+        "SGOCR_DISABLED_QUESTION_TYPES": "YES_NO",
+        "SGOCR_RG_CAP": "1",
+        "SGOCR_RG_STRUCTURAL_GUARD": "1",
+        "SGOCR_RG_VDEP_GUARD": "1",
+        "SGOCR_TP_VISUAL_ONLY_CAP": "1"
+      },
+      "rescue": {
+        "max_images": 48,
+        "min_types_per_image": 4,
+        "rescue_target_per_image": 4
+      }
+    },
+    "precision_r72_t6": {
+      "description": "Same precision-first logic, rescue top 72 weak-coverage images",
+      "env_overrides": {
+        "SGOCR_DISABLED_QUESTION_TYPES": "YES_NO",
+        "SGOCR_RG_CAP": "1",
+        "SGOCR_RG_STRUCTURAL_GUARD": "1",
+        "SGOCR_RG_VDEP_GUARD": "1",
+        "SGOCR_TP_VISUAL_ONLY_CAP": "1"
+      },
+      "rescue": {
+        "max_images": 72,
+        "min_types_per_image": 4,
+        "rescue_target_per_image": 4
+      }
+    },
+    "apheavy_r72_t6": {
+      "description": "AP-heavy recovery with stronger anchor-property weights",
+      "env_overrides": {
+        "SGOCR_DISABLED_QUESTION_TYPES": "YES_NO",
+        "SGOCR_RG_CAP": "1",
+        "SGOCR_RG_STRUCTURAL_GUARD": "1",
+        "SGOCR_RG_VDEP_GUARD": "1",
+        "SGOCR_TP_VISUAL_ONLY_CAP": "1",
+        "SGOCR_AP_MISSING_WEIGHT": "3.0",
+        "SGOCR_PROPERTY_DIVERSITY_BONUS": "0.40"
+      },
+      "rescue": {
+        "max_images": 72,
+        "min_types_per_image": 4,
+        "rescue_target_per_image": 4
+      }
+    },
+    "balanced_r72_t6_yesno1": {
+      "description": "Balanced recovery allowing at most 1 positive YES/NO per image",
+      "env_overrides": {
+        "SGOCR_YESNO_CAP": "1",
+        "SGOCR_YESNO_POSITIVE_ONLY": "1",
+        "SGOCR_RG_CAP": "1",
+        "SGOCR_RG_STRUCTURAL_GUARD": "1",
+        "SGOCR_RG_VDEP_GUARD": "1",
+        "SGOCR_TP_VISUAL_ONLY_CAP": "1"
+      },
+      "rescue": {
+        "max_images": 72,
+        "min_types_per_image": 4,
+        "rescue_target_per_image": 4
+      }
+    }
+  }
+}
