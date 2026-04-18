@@ -13,6 +13,9 @@ import numpy as np
 from PIL import Image
 import torch
 
+from lib.infra.device import resolve_device
+from lib.infra.io import load_jsonl
+
 from .bootstrap import REGION_PHRASES, REGION_SYNONYMS, area_bucket, density_bucket, is_valid_text, normalize_answer, region_key_for_bbox, write_json, write_jsonl
 from .bootstrap_kd import bbox_xywh_to_xyxy, bbox_xyxy_to_xywh, compute_resolvability, overlap_fraction
 from .consensus import OCRVote, choose_consensus
@@ -1374,13 +1377,6 @@ def build_dev40_semantic_dataset(
     )
     write_json(out_dir / "summary.json", summary)
     return summary
-
-
-def resolve_device(device_arg: str) -> str:
-    choice = str(device_arg or "auto").strip().lower()
-    if choice == "auto":
-        return "cuda" if torch.cuda.is_available() else "cpu"
-    return choice
 
 
 def load_image_specs(source_experiment_dir: Path) -> tuple[list[dict[str, str]], dict[str, str]]:
@@ -2767,10 +2763,6 @@ def _length_bucket(text: str) -> str:
     if length <= 10:
         return "medium_5_10"
     return "long_11_plus"
-
-
-def load_jsonl(path: Path) -> list[dict[str, Any]]:
-    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
 
 
 def recompute_text_node_resolvability(text_nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:

@@ -8,6 +8,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
+from lib.infra.io import write_json, write_jsonl
+
 
 VALID_TEXT_RE = re.compile(r"[A-Za-z0-9]")
 DEGENERATE_THIN_TEXT_RE = re.compile(r"^[1il|]+$", re.IGNORECASE)
@@ -301,18 +303,6 @@ def select_dev_subset(candidates: list[BootstrapTuple], *, limit: int = 200, see
             break
     selected.sort(key=lambda row: row.image_id)
     return selected
-
-
-def write_json(path: Path, payload: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-
-
-def write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as f:
-        for row in rows:
-            f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
 def build_and_write_dev_subset(

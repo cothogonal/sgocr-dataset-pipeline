@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .bootstrap import write_json, write_jsonl
+from lib.infra.io import load_json, load_jsonl, write_json, write_jsonl
 
 
 _GENERIC_RESCUE_ANCHORS = frozenset({
@@ -28,18 +28,6 @@ _GENERIC_RESCUE_ANCHORS = frozenset({
     "area",
     "region",
 })
-
-
-def load_json(path: Path) -> dict[str, Any] | None:
-    if not path.exists():
-        return None
-    return json.loads(path.read_text(encoding="utf-8"))
-
-
-def load_jsonl(path: Path) -> list[dict[str, Any]]:
-    if not path.exists():
-        return []
-    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
 
 
 @dataclass(frozen=True)
