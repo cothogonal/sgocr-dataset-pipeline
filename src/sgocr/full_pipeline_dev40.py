@@ -10,8 +10,8 @@ from typing import Any
 
 import torch
 
-from lib.infra.device import resolve_device
-from lib.infra.io import load_jsonl
+from .device import resolve_device
+from .io import load_jsonl
 
 from .bootstrap import write_json, write_jsonl
 from .bootstrap_kd import bbox_xywh_to_xyxy

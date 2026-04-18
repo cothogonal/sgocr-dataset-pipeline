@@ -25,23 +25,16 @@ from ..dual_anchor import (
     write_source_subset,
 )
 from ..nemotron_frontend import nemotron_frontend_diagnostic
-from ..paths import LOGS_ROOT, OCR_SPATIAL_QA_FINAL_ROOT, OCR_SPATIAL_QA_INTERMEDIATE_ROOT, REPO_ROOT
+from ..paths import LOGS_ROOT, OCR_SPATIAL_QA_FINAL_ROOT, OCR_SPATIAL_QA_INTERMEDIATE_ROOT, REPO_ROOT, SRC_ROOT
 from ..run_quality import compute_anchor_coverage, compute_answer_distribution, compute_run_quality
-from .mixed_dam01_sweep import VARIANT_DESCRIPTIONS, _build_variants
-from .mixed_ocr_frontend_canary import _build_variant_cmd
+from .production_config import VARIANT_DESCRIPTIONS, build_variant_cmd, build_variants
 
 
-DEFAULT_CHAMPION_SOURCE_MANIFEST = (
+DEFAULT_PRIOR_SOURCE_MANIFEST = (
     OCR_SPATIAL_QA_FINAL_ROOT
     / "mixed_dev150"
     / "chartqa50_textocr50_cocotext50_source_20260410_110952"
     / "manifest.json"
-)
-CHAMPION_DOC_PATH = REPO_ROOT / "tasks" / "mm_bridge" / "docs" / "SGOCR_CHAMPION.md"
-CHAMPION_ARTIFACT_DIR = (
-    OCR_SPATIAL_QA_FINAL_ROOT
-    / "mixed_dev150"
-    / "sgocr_dam01_20260417_081018_balanced_dam01_r48"
 )
 TARGET_VARIANT = "balanced_dam01_r48"
 
@@ -355,7 +348,7 @@ def _run_variant_streaming(
         metrics = compute_run_quality(summary, rows)
         return {"status": "cached", "metrics": metrics, "summary": summary}
 
-    cmd, env = _build_variant_cmd(
+    cmd, env = build_variant_cmd(
         source_dir=source_dir,
         out_dir=out_dir,
         intermediate_dir=intermediate_dir,
@@ -503,12 +496,9 @@ def _render_report(payload: dict[str, Any]) -> str:
         f"- Next-run exclude manifest: `{payload['next_run_exclude_manifest_path']}`",
         f"- Next-run exclude ids: `{payload['next_run_exclude_image_ids_path']}`",
         "",
-        "## Prepared Launch",
+        "## Reproduction",
         "",
-        f"- Launcher: `{payload['launcher_path']}`",
-        f"- Safe start command: `{payload['launch_command']}`",
-        f"- Champion doc: `{payload['champion_doc_path']}`",
-        f"- Frozen champion artifact: `{payload['champion_artifact_dir']}`",
+        f"- Command: `{payload['launch_command']}`",
         "",
         "## Phase Status",
         "",
@@ -562,8 +552,8 @@ def main() -> None:
 
     existing_payload = load_json(report_json)
     exclude_manifest_paths = [Path(p).resolve() for p in args.exclude_manifests]
-    if not exclude_manifest_paths:
-        exclude_manifest_paths = [DEFAULT_CHAMPION_SOURCE_MANIFEST.resolve()]
+    if not exclude_manifest_paths and DEFAULT_PRIOR_SOURCE_MANIFEST.exists():
+        exclude_manifest_paths = [DEFAULT_PRIOR_SOURCE_MANIFEST.resolve()]
 
     if not source_dir.exists():
         source_manifest = build_source_universe_with_exclusions(
@@ -577,7 +567,7 @@ def main() -> None:
     else:
         source_manifest = json.loads((source_dir / "manifest.json").read_text(encoding="utf-8"))
 
-    variants = _build_variants(args)
+    variants = build_variants(args)
     variant_spec = variants[TARGET_VARIANT]
     primary_spec = variants["primary_gemma"]
 
@@ -598,10 +588,11 @@ def main() -> None:
             "exclude_manifests": [str(path) for path in exclude_manifest_paths],
             "next_run_exclude_manifest_path": str(source_dir / "next_run_exclude_manifest.json"),
             "next_run_exclude_image_ids_path": str(source_dir / "next_run_exclude_image_ids.jsonl"),
-            "launcher_path": str(REPO_ROOT / "tasks" / "mm_bridge" / "scripts" / "launch_sgocr_mixed3000_balanced_dam01_run.sh"),
-            "launch_command": f"cd {REPO_ROOT} && START_RUN=1 BUNDLE_ID={bundle_id} bash tasks/mm_bridge/scripts/launch_sgocr_mixed3000_balanced_dam01_run.sh",
-            "champion_doc_path": str(CHAMPION_DOC_PATH),
-            "champion_artifact_dir": str(CHAMPION_ARTIFACT_DIR),
+            "launch_command": (
+                f"cd {REPO_ROOT} && PYTHONPATH={SRC_ROOT} "
+                f"{sys.executable} -m sgocr.scripts.mixed3000_balanced_dam01_run "
+                f"--bundle-id {bundle_id} --source-name {source_dir.name}"
+            ),
             "nemotron_diagnostic": nemotron_frontend_diagnostic(),
             "performance_profile": {
                 "workers": int(args.workers),

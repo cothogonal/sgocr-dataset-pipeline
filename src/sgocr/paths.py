@@ -1,16 +1,24 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 
-REPO_ROOT = Path(__file__).resolve().parents[3]
-SGOCR_ROOT = REPO_ROOT / "sgocr"
+SGOCR_ROOT = Path(os.environ.get("SGOCR_ROOT", Path(__file__).resolve().parents[2])).resolve()
+_MONOREPO_ROOT = SGOCR_ROOT.parent
+REPO_ROOT = Path(
+    os.environ.get(
+        "SGOCR_REPO_ROOT",
+        _MONOREPO_ROOT
+        if (_MONOREPO_ROOT / "sgocr").resolve() == SGOCR_ROOT and (_MONOREPO_ROOT / "DATASETS.md").exists()
+        else SGOCR_ROOT,
+    )
+).resolve()
 SRC_ROOT = SGOCR_ROOT / "src"
 TEST_ROOT = SGOCR_ROOT / "test"
 
-# Shared assets may resolve into the linked old repo; use resolved paths for data and logs.
-DATA_ROOT = (REPO_ROOT / "data").resolve()
-LOGS_ROOT = (REPO_ROOT / "logs").resolve()
+DATA_ROOT = Path(os.environ.get("SGOCR_DATA_ROOT", REPO_ROOT / "data")).resolve()
+LOGS_ROOT = Path(os.environ.get("SGOCR_LOGS_ROOT", REPO_ROOT / "logs")).resolve()
 
 OCR_SPATIAL_QA_ROOT = DATA_ROOT / "ocr_spatial_qa"
 OCR_SPATIAL_QA_RAW_ROOT = OCR_SPATIAL_QA_ROOT / "raw"

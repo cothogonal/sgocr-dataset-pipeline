@@ -22,7 +22,7 @@ from PIL import Image
 from ..bootstrap import write_json, write_jsonl
 from ..paths import LOGS_ROOT, OCR_SPATIAL_QA_FINAL_ROOT, OCR_SPATIAL_QA_INTERMEDIATE_ROOT, REPO_ROOT, repo_relative
 from ..secrets import GEMINI, OPENAI, get_secret
-from train.vqa_data import normalize_text_answer, normalize_vqa_answer
+from ..answer_norm import normalize_text_answer, normalize_vqa_answer
 
 
 DEFAULT_BUNDLE_ID = "sgocr_dev200_20260406_200346"

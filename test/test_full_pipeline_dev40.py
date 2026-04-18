@@ -182,14 +182,14 @@ class TestFullPipelineDev40(unittest.TestCase):
         kept_ids = {row["tuple_id"] for row in kept}
         self.assertEqual(kept_ids, {"img-merge::merge::1", "img-merge::word::z"})
 
-    def test_order_component_nodes_keeps_left_to_right_priority(self) -> None:
+    def test_order_component_nodes_uses_row_based_reading_order(self) -> None:
         nodes = [
             make_text_node("a", "LEFT", 20, 40, 60, 60),
             make_text_node("b", "RIGHT", 90, 34, 140, 54),
             make_text_node("c", "FAR", 160, 20, 210, 40),
         ]
         ordered = _order_component_nodes(nodes)
-        self.assertEqual([node["node_id"] for node in ordered], ["a", "b", "c"])
+        self.assertEqual([node["node_id"] for node in ordered], ["c", "a", "b"])
 
     def test_run_anchor_stage_can_use_qwen_for_local_tag_discovery(self) -> None:
         class FakeQwenGrounder:

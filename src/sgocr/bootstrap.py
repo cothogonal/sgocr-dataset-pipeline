@@ -8,7 +8,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
-from lib.infra.io import write_json, write_jsonl
+from .io import write_json, write_jsonl
 
 
 VALID_TEXT_RE = re.compile(r"[A-Za-z0-9]")

@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from lib.infra.io import load_json, load_jsonl, write_json, write_jsonl
+from .io import load_json, load_jsonl, write_json, write_jsonl
 
 
 _GENERIC_RESCUE_ANCHORS = frozenset({

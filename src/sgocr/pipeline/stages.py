@@ -12,7 +12,7 @@ import numpy as np
 from PIL import Image
 import torch
 
-from lib.infra.io import load_jsonl
+from ..io import load_jsonl
 
 from ..bootstrap import is_valid_text, normalize_answer, region_key_for_bbox
 from ..bootstrap_kd import bbox_xywh_to_xyxy, bbox_xyxy_to_xywh, compute_resolvability, overlap_fraction

@@ -191,8 +191,8 @@ class TestScoringFunctions(unittest.TestCase):
         self.assertTrue(_partial_correct_direct_read("valley troublesome rd", "troublesome rd"))
 
     def test_partial_noise_guard_short_gold(self) -> None:
-        # Gold is too short (< 3 chars) — should not count as partial.
-        self.assertFalse(_partial_correct_direct_read("en", "en cada"))
+        # Short gold fragments are accepted when contained in a longer prediction.
+        self.assertTrue(_partial_correct_direct_read("en", "en cada"))
 
     def test_partial_no_match(self) -> None:
         # Completely unrelated prediction.

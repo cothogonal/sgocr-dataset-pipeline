@@ -1,0 +1,13 @@
+Pillow
+numpy
+requests
+torch
+torchvision
+transformers
+google-genai
+vllm
+qwen-vl-utils
+paddleocr
+paddlepaddle-gpu
+opencv-python
+craft-text-detector
