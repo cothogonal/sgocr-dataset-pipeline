@@ -8,7 +8,7 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
-from .bootstrap import (
+from ..bootstrap import (
     REGION_PHRASES,
     REGION_SYNONYMS,
     area_bucket,
@@ -18,7 +18,7 @@ from .bootstrap import (
     write_json,
     write_jsonl,
 )
-from .bootstrap_kd import (
+from ..bootstrap_kd import (
     bbox_xywh_to_xyxy,
     bbox_xyxy_to_xywh,
     build_resolvability_stats,
@@ -29,8 +29,8 @@ from .bootstrap_kd import (
     load_bootstrap_text_nodes,
     overlap_fraction,
 )
-from .semantic_grounding import extract_anchor_color
-from .semantic_dev40_tuning import load_semantic_dev40_tuning
+from ..semantic_grounding import extract_anchor_color
+from ..semantic_dev40_tuning import load_semantic_dev40_tuning
 
 from .dataset_assembly import (
     _anchor_for_region,

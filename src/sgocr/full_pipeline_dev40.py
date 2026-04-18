@@ -29,10 +29,10 @@ from .ocr_runtime import PARSeqRecognizer, PaddleOCRRecognizer, TrOCRRecognizer
 from .run_quality import compute_run_quality
 from .semantic_dev40_tuning import load_semantic_dev40_tuning
 
-from .tuple_builder import *  # noqa: F401,F403
-from .pipeline_stages import *  # noqa: F401,F403
+from .pipeline.tuple_builder import *  # noqa: F401,F403
+from .pipeline.stages import *  # noqa: F401,F403
 
-from .pipeline_stages import (
+from .pipeline.stages import (
     RUNTIME_MODELS,
     SEMANTIC_PROMPT_VARIANT,
     _anchor_relabel_model_name,
@@ -46,17 +46,17 @@ from .pipeline_stages import (
     run_detection_stage,
     run_recognition_stage,
 )
-from .tuple_builder import (
+from .pipeline.tuple_builder import (
     _filter_subsumed_rows,
     _order_component_nodes,
     build_verified_tuples,
     recompute_text_node_resolvability,
 )
-from .pipeline_stages import (
+from .pipeline.stages import (
     QwenAnchorGrounderVLLM,
     refine_anchor_labels,
 )
-from .tuple_builder import _anchor_area_fraction  # noqa: F401
+from .pipeline.tuple_builder import _anchor_area_fraction  # noqa: F401
 
 
 def build_dev40_semantic_dataset(

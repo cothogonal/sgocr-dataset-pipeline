@@ -14,19 +14,19 @@ import torch
 
 from lib.infra.io import load_jsonl
 
-from .bootstrap import is_valid_text, normalize_answer, region_key_for_bbox
-from .bootstrap_kd import bbox_xywh_to_xyxy, bbox_xyxy_to_xywh, compute_resolvability, overlap_fraction
-from .dev40_complete import union_bbox
-from .consensus import OCRVote, choose_consensus
-from .ocr_runtime import CraftDetector, PARSeqRecognizer, PaddleOCRDetector, PaddleOCRRecognizer, TrOCRRecognizer, bbox_to_polygon, crop_with_padding
-from .ollama_anchor import (
+from ..bootstrap import is_valid_text, normalize_answer, region_key_for_bbox
+from ..bootstrap_kd import bbox_xywh_to_xyxy, bbox_xyxy_to_xywh, compute_resolvability, overlap_fraction
+from .dataset_assembly import union_bbox
+from ..consensus import OCRVote, choose_consensus
+from ..ocr_runtime import CraftDetector, PARSeqRecognizer, PaddleOCRDetector, PaddleOCRRecognizer, TrOCRRecognizer, bbox_to_polygon, crop_with_padding
+from ..ollama_anchor import (
     GEMMA_INDEPENDENT_INVENTORY_PROMPT_ITA15,
     GEMMA_INDEPENDENT_INVENTORY_PROMPT_ITA16_ANTIDOC,
     GEMMA_INDEPENDENT_INVENTORY_PROMPT_ITA16_COMPACT,
     GEMMA_STRUCTURAL_FALLBACK_PROMPT_ITA15,
     GemmaOllamaAnchorGrounder,
 )
-from .qwen_anchor_vllm import (
+from ..qwen_anchor_vllm import (
     INDEPENDENT_QWEN_INVENTORY_PROMPT,
     INDEPENDENT_QWEN_INVENTORY_PROMPT_ANTI_OCR,
     INDEPENDENT_QWEN_INVENTORY_PROMPT_DAM01,
@@ -42,8 +42,8 @@ from .qwen_anchor_vllm import (
     merge_qwen_inventory_passes,
     normalize_qwen_description,
 )
-from .semantic_dev40_tuning import load_semantic_dev40_tuning
-from .semantic_grounding import (
+from ..semantic_dev40_tuning import load_semantic_dev40_tuning
+from ..semantic_grounding import (
     FlorenceTagger,
     FALLBACK_TAGS,
     GeminiAnchorRelabeler,
@@ -767,7 +767,7 @@ def run_anchor_stage(
             )
 
             if tuning.qwen_structural_fallback_enabled:
-                from .qwen_anchor_vllm import (
+                from ..qwen_anchor_vllm import (
                     STRUCTURAL_FALLBACK_QWEN_PROMPT,
                     STRUCTURAL_FALLBACK_QWEN_PROMPT_ANTI_OCR,
                     STRUCTURAL_FALLBACK_QWEN_PROMPT_DAM01,

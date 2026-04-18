@@ -5,12 +5,12 @@ import statistics
 from collections import Counter, defaultdict
 from typing import Any
 
-from .bootstrap import REGION_PHRASES, REGION_SYNONYMS, area_bucket, density_bucket, is_valid_text, normalize_answer, region_key_for_bbox
-from .bootstrap_kd import bbox_xywh_to_xyxy, bbox_xyxy_to_xywh, compute_resolvability, overlap_fraction
-from .dev40_complete import union_bbox
-from .ocr_runtime import bbox_to_polygon
-from .semantic_dev40_tuning import load_semantic_dev40_tuning
-from .semantic_grounding import (
+from ..bootstrap import REGION_PHRASES, REGION_SYNONYMS, area_bucket, density_bucket, is_valid_text, normalize_answer, region_key_for_bbox
+from ..bootstrap_kd import bbox_xywh_to_xyxy, bbox_xyxy_to_xywh, compute_resolvability, overlap_fraction
+from .dataset_assembly import union_bbox
+from ..ocr_runtime import bbox_to_polygon
+from ..semantic_dev40_tuning import load_semantic_dev40_tuning
+from ..semantic_grounding import (
     GENERIC_TEXT_ANCHORS,
     anchor_local_location_metadata,
     anchor_relevance,
@@ -616,7 +616,7 @@ def build_verified_tuples(
     grounded_anchor_rows: list[dict[str, Any]],
     image_source_map: dict[str, str],
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    from .pipeline_stages import _make_stage_progress_logger
+    from .stages import _make_stage_progress_logger
 
     nodes_by_image: dict[str, list[dict[str, Any]]] = defaultdict(list)
     all_nodes_by_image: dict[str, list[dict[str, Any]]] = defaultdict(list)

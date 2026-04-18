@@ -16,8 +16,8 @@ from .gemini_batch import GeminiBatchRequest, batch_generate_json, image_part_fr
 from .semantic_dev40_tuning import load_semantic_dev40_tuning
 from .secrets import GEMINI, get_secret
 
-from .anchor_analysis import *  # noqa: F401,F403
-from .anchor_analysis import (
+from .pipeline.anchor_analysis import *  # noqa: F401,F403
+from .pipeline.anchor_analysis import (
     _dedupe_labels,
     is_generic_anchor_label,
     sanitize_anchor_label,

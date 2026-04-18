@@ -13,15 +13,15 @@ from typing import Any
 
 import requests
 
-from .bootstrap import (
+from ..bootstrap import (
     normalize_answer,
     write_json,
     write_jsonl,
 )
-from .gemini_batch import GeminiBatchRequest, batch_generate_json, image_part_from_payload
-from .semantic_dev40_tuning import load_semantic_dev40_tuning
-from .secrets import GEMINI, get_secret
-from .teacher.http_clients import encode_image
+from ..gemini_batch import GeminiBatchRequest, batch_generate_json, image_part_from_payload
+from ..semantic_dev40_tuning import load_semantic_dev40_tuning
+from ..secrets import GEMINI, get_secret
+from ..teacher.http_clients import encode_image
 
 from .question_builder import (
     _unique_anchor_can_skip_global_location,

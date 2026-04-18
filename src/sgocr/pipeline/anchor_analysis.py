@@ -8,9 +8,9 @@ from typing import Any
 
 from PIL import Image
 
-from .bootstrap import normalize_answer
-from .bootstrap_kd import center_from_box, centroid_from_polygon, determine_relation, distance_point_to_box, overlap_fraction
-from .semantic_dev40_tuning import load_semantic_dev40_tuning
+from ..bootstrap import normalize_answer
+from ..bootstrap_kd import center_from_box, centroid_from_polygon, determine_relation, distance_point_to_box, overlap_fraction
+from ..semantic_dev40_tuning import load_semantic_dev40_tuning
 
 
 STOPWORDS = {
